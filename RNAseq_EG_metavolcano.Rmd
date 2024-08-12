@@ -1,0 +1,1435 @@
+---
+title: "RNAseq inhouse data (early-gestation and term-gestation hofbauer cells) - metavolcano"
+author: "Viviane Schuch"
+date: "2024-08-08"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(DESeq2)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(fgsea)
+library(sva)
+library(umap)
+# library(maptools)
+library(ggrepel)
+library(reshape2)
+library(CEMiTool)
+library(limma)
+library(stringr)
+library(mdp)
+library(fastDummies)
+library(data.table)
+```
+
+# set workingdir
+
+```{r workingdir, message = FALSE, warning = FALSE}
+workingdir <- "/home/vivischuch/Documents/RNAseq_inhouse_data/"
+setwd(workingdir)
+```
+
+# read raw counts
+
+```{r read_counts, message = FALSE, warning = FALSE}
+counts_df <- read.table(paste0(workingdir, "counts/read_counts_mRNA.csv"), header = TRUE, sep = "\t", row.names=2)
+counts_df <- counts_df[, -c(1, 2), drop = FALSE] 
+counts_df <- counts_df[complete.cases(counts_df), ]
+counts_df <- round(counts_df)
+
+cols_to_keep <- !grepl("ZIKV_eg|ZIKV_T", names(counts_df))
+
+# Subsetting the counts_df to keep only the selected columns
+counts_df <- counts_df[, cols_to_keep]
+```
+
+# prepare the sample_info dataframe from colnames of counts_df
+
+```{r metadata, message = FALSE, warning = FALSE}
+sample_names <- colnames(counts_df)
+
+sample_info <- data.frame(
+  SampleName = sample_names,
+  stringsAsFactors = FALSE
+)
+
+sample_info <- separate(sample_info, col = "SampleName", into = c("Sample", "Group", "Gestation"), sep = "_", remove = FALSE)
+sample_info$Data_type <- gsub(".*?([^_]+$)", "\\1", sample_info$Gestation)
+sample_info$Gestation <- gsub(".Read.Count", "", sample_info$Gestation)
+sample_info$Data_type <- gsub("^[^\\.]+\\.(.*)$", "\\1", sample_info$Data_type)
+sample_info$Stimuli <- sample_info$Group
+sample_info$Group <- paste0(sample_info$Group, "_", sample_info$Gestation)
+
+sample_info <- sample_info %>%
+  mutate(Batch = case_when(
+    SampleName %in% c("R32_NT_eg.Read.Count", "R33_NT_eg.Read.Count", "R34_NT_eg.Read.Count", "R35_NT_eg.Read.Count", "R36_NT_T.Read.Count") ~ "Batch 1",
+    # SampleName %in% c("R11_CMV_T.Read.Count", "R20_CMV_T.Read.Count", "R4_CMV_T.Read.Count", "R17_CMV_T.Read.Count")  ~ "Batch 2",
+    SampleName %in% c("R14_CMV_T.Read.Count", "R21_HIV_eg.Read.Count", "R21_NT_eg.Read.Count", "R24_CMV_eg.Read.Count") ~ "Batch 3",
+    TRUE ~ "Batch 0"
+  ))
+
+sample_info$Class <- sample_info$Group
+sample_info <- sample_info %>% 
+  dplyr::select(Sample, Class, everything())
+
+sample_info <- as.data.frame(sample_info)
+sample_info$Class <- factor(sample_info$Class)
+# sample_info$Batch <- factor(sample_info$Batch, levels = c("Batch 0", "Batch 1", "Batch 2", "Batch 3"))
+sample_info$Batch <- factor(sample_info$Batch, levels = c("Batch 0", "Batch 1", "Batch 3"))
+sample_info$Group <- factor(sample_info$Group, levels = unique(sample_info$Group))
+
+library(dplyr)
+
+sample_info <- sample_info %>%
+  filter(!Class %in% c("ZIKV_eg", "ZIKV_T"))
+```
+
+# create DESeqDataSet
+
+```{r create_DESeqDataSet, message = FALSE, warning = FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts_df, colData = sample_info, design = ~ Group)
+
+# Filtering and normalization
+dds <- dds[rowSums(counts(dds)) > 1, ]
+dds <- DESeq(dds)
+```
+
+
+# Metavolcano
+
+
+# CMV-T
+```{r}
+library(DESeq2)
+library(dplyr)
+
+results_list <- list()
+
+nt_t_samples <- sample_info %>%
+  filter(Group == "NT_T") %>%
+  pull(SampleName)
+
+cmv_t_samples <- sample_info %>%
+  filter(Group == "CMV_T") %>%
+  pull(SampleName)
+
+# Perform Differential Expression Analysis
+for (cmv_t_sample in cmv_t_samples) {
+  sample_info$custom_group <- ifelse(sample_info$SampleName == cmv_t_sample, "CMV_T",
+                                     ifelse(sample_info$SampleName %in% nt_t_samples, "NT_T", NA))
+  
+  sample_info$custom_group <- factor(sample_info$custom_group)
+  temp_sample_info <- sample_info[!is.na(sample_info$custom_group), ]
+  temp_dds <- dds[, temp_sample_info$SampleName]
+  colData(temp_dds) <- DataFrame(temp_sample_info)
+  colData(temp_dds)$custom_group <- factor(colData(temp_dds)$custom_group)
+  design(temp_dds) <- ~ custom_group
+  temp_dds <- DESeq(temp_dds)
+  results_name <- paste(cmv_t_sample, "vs_NT_T", sep = "_")
+  results_list[[results_name]] <- results(temp_dds, contrast = c("custom_group", "CMV_T", "NT_T"))
+}
+
+add_ci_and_prepare_for_metavolcano <- function(result, conf_level = 0.95) {
+  result_df <- as.data.frame(result)
+  result_df <- result_df %>% dplyr::filter(!is.na(log2FoldChange), !is.na(pvalue))
+  z_score <- qnorm((1 + conf_level) / 2)
+  result_df$CI_Lower <- result_df$log2FoldChange - (z_score * result_df$lfcSE)
+  result_df$CI_Upper <- result_df$log2FoldChange + (z_score * result_df$lfcSE)
+  if(!"Symbol" %in% colnames(result_df)) {
+    result_df$Symbol <- rownames(result_df)
+  }
+  metavolcano_input <- result_df %>%
+    dplyr::select(Symbol, Log2FC = log2FoldChange, pvalue, CI.Lower = CI_Lower, CI.Upper = CI_Upper)
+  return(metavolcano_input)
+}
+
+# Apply the function to each element in the results_list
+results_list_ci <- lapply(results_list, add_ci_and_prepare_for_metavolcano)
+```
+
+
+
+```{r}
+jobname <- "CMV_T"
+
+dir <- paste0("/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/")
+input <- "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/input/"
+outputfolder <- "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/output/"
+
+d <- results_list_ci
+
+meta_degs_rem <- rem_mv(diffexp=d,
+                        pcriteria="pvalue",
+                        foldchangecol='Log2FC', 
+                        genenamecol='Symbol',
+                        geneidcol=NULL,
+                        collaps=TRUE,
+                        llcol='CI.Lower',
+                        rlcol='CI.Upper',
+                        vcol=NULL, 
+                        cvar=TRUE,
+                        metathr=0.01,
+                        jobname=jobname,
+                        outputfolder=outputfolder, 
+                        draw='PDF',
+                        ncores=4)
+
+
+
+write.csv(meta_degs_rem@metaresult, paste0(outputfolder, "meta_degs_rem@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_rem@input, paste0(outputfolder, "meta_degs_rem@input.csv_", jobname, ".csv"),row.names=F)
+
+meta_degs_rem <- meta_degs_rem@metaresult
+
+# draw_forest(remres=meta_degs_rem,
+#             gene="SELE",
+#             genecol="Symbol", 
+#             foldchangecol="Log2FC",
+#             llcol="CI.Lower", 
+#             rlcol="CI.Upper",
+#             jobname=jobname,
+#             outputfolder=outputfolder,
+#             draw="PDF")
+
+meta_degs_vote <- votecount_mv(diffexp=d,
+                               pcriteria="pvalue",
+                               foldchangecol='Log2FC',
+                               genenamecol='Symbol',
+                               geneidcol=NULL,
+                               pvalue=0.05,
+                               foldchange=0, 
+                               metathr=0.01,
+                               collaps=FALSE,
+                               jobname=jobname, 
+                               outputfolder=outputfolder,
+                               draw='PDF')
+
+meta_degs_vote@MetaVolcano
+
+write.csv(meta_degs_vote@metaresult, paste0(outputfolder, "meta_degs_vote@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_vote@input, paste0(outputfolder, "meta_degs_vote@input_", jobname, ".csv"),row.names=F)
+
+
+meta_degs_comb <- combining_mv(diffexp=d,
+                               pcriteria="pvalue", 
+                               foldchangecol='Log2FC',
+                               genenamecol='Symbol',
+                               geneidcol=NULL,
+                               metafc='Mean',
+                               metathr=0.01, 
+                               collaps=TRUE,
+                               jobname=jobname,
+                               outputfolder=outputfolder,
+                               draw='PDF')
+
+write.csv(meta_degs_comb@metaresult, paste0(outputfolder, "meta_degs_comb@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_comb@input, paste0(outputfolder, "meta_degs_comb@input_", jobname, ".csv"),row.names=F)
+
+```
+
+
+```{r}
+library(DESeq2)
+library(dplyr)
+library(tidyverse)
+
+# Filter based on signcon column
+filtered_data <- meta_degs_rem %>%
+  filter(abs(signcon) > 2)
+
+# Assuming 'randomSummary' column contains the log2FC and you want to use it as ranks
+ranks <- filtered_data %>%
+  dplyr::select(Gene = Symbol, Rank = randomSummary) %>%
+  deframe()  # Convert to named vector
+
+hallmarks <- fgsea::gmtPathways(paste0(workingdir, "genesets/hallmark.genesets.v6.1.symbols.gmt"))
+
+results_dir <- paste0(workingdir, "results/hallmark_meta/")
+  if (!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+
+set.seed(123) # for reproducibility
+noise <- runif(length(ranks), min=-1e-10, max=1e-10)
+ranked_genes <- ranks + noise
+# Sort genes by log2FoldChange to create a ranked list
+ranked_genes_sorted <- sort(ranked_genes, decreasing = TRUE)
+  
+# Perform FGSEA using fgseaMultilevel and handle pathways with unbalanced stats
+fgsea_results <- fgseaMultilevel(pathways = hallmarks, stats = ranked_genes_sorted, nPermSimple = 10000)
+  
+# Filter for significant pathways
+gsea_sig <- fgsea_results %>% dplyr::filter(pval <= 0.05) %>% dplyr::arrange(desc(NES))
+
+gsea_sig$pathway <- gsub("HALLMARK_", "", gsea_sig$pathway) # Remove "HALLMARK "
+gsea_sig$pathway <- tolower(gsea_sig$pathway) # Convert to lowercase
+gsea_sig$pathway <- sapply(gsea_sig$pathway, function(x) {
+  paste(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))), sep = "")
+})
+
+p <- ggplot(gsea_sig, aes(NES, pathway)) +
+      geom_point(aes(colour = pval, size = size)) +
+      scale_color_gradientn(colours = rainbow(4), limits = c(0, 0.05)) +
+      theme(panel.background = element_rect(fill = "gray95", colour = "gray95"),
+            panel.grid.major = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            panel.grid.minor = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            axis.title.y = element_blank()) +
+      expand_limits(x = c(-3, 4)) +
+      scale_x_continuous(breaks = c(-3, -2, -1, 0, 1, 2, 3, 4)) +
+      scale_y_discrete(limits = rev(gsea_sig$pathway)) +
+      ggtitle(paste0("Hallmark Pathways ", jobname, " MetaDegs")) +
+      geom_vline(xintercept = 0, color = "gray", linetype = "dashed")
+p    
+
+gsea_sig_filtered <- gsea_sig
+
+p_filtered <- ggplot(gsea_sig_filtered, aes(NES, pathway)) +
+  geom_segment(aes(x = 0, xend = NES, y = pathway, yend = pathway), color = "gray50") +
+  geom_point(aes(colour = pval), size = 5, shape = 20) +  # Set size outside aes() and remove legend
+  scale_color_gradient(low = "darkblue", high = "lightblue", limits = c(0, 0.05)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_line(color = "gray94"),  # Add vertical gray lines
+    panel.grid.major.y = element_line(color = "gray90"),  # Add horizontal gray lines
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),  # Blank background
+    axis.title.y = element_blank(),
+    axis.line.x = element_line(color = "gray50"),  # Add x-axis line
+    plot.title = element_text(hjust = 0.5)  # Center the title
+  ) +
+  coord_cartesian(xlim = range(gsea_sig_filtered$NES, na.rm = TRUE)) +  # Set x-axis limits including negative values
+  scale_x_continuous(breaks = seq(floor(min(gsea_sig_filtered$NES)), ceiling(max(gsea_sig_filtered$NES)), by = 1)) +  # Adjust x-axis breaks
+  scale_y_discrete(limits = rev(gsea_sig_filtered$pathway)) +
+  ggtitle(paste0("Hallmark genesets ", jobname, " metaDEGs")) +
+  geom_vline(xintercept = 0, color = "gray50") 
+
+# Print the plot
+print(p_filtered)
+```
+
+# Metavolcano
+
+# CMV-eg
+```{r}
+library(DESeq2)
+library(dplyr)
+
+# Initialize an empty list to store DESeq2 results
+results_list <- list()
+
+nt_eg_samples <- sample_info %>%
+  filter(Group == "NT_eg") %>%
+  pull(SampleName)
+
+cmv_eg_samples <- sample_info %>%
+  filter(Group == "CMV_eg") %>%
+  pull(SampleName)
+
+# Step 2: Perform Differential Expression Analysis
+for (cmv_eg_sample in cmv_eg_samples) {
+  sample_info$custom_group <- ifelse(sample_info$SampleName == cmv_eg_sample, "CMV_eg",
+                                     ifelse(sample_info$SampleName %in% nt_eg_samples, "NT_eg", NA))
+  sample_info$custom_group <- factor(sample_info$custom_group)
+  temp_sample_info <- sample_info[!is.na(sample_info$custom_group), ]
+  temp_dds <- dds[, temp_sample_info$SampleName]
+  colData(temp_dds) <- DataFrame(temp_sample_info)
+  colData(temp_dds)$custom_group <- factor(colData(temp_dds)$custom_group)
+  design(temp_dds) <- ~ custom_group
+  temp_dds <- DESeq(temp_dds)
+  results_name <- paste(cmv_eg_sample, "vs_NT_eg", sep = "_")
+  results_list[[results_name]] <- results(temp_dds, contrast = c("custom_group", "CMV_eg", "NT_eg"))
+}
+
+add_ci_and_prepare_for_metavolcano <- function(result, conf_level = 0.95) {
+  result_df <- as.data.frame(result)
+  result_df <- result_df %>% dplyr::filter(!is.na(log2FoldChange), !is.na(pvalue))
+  z_score <- qnorm((1 + conf_level) / 2)
+  result_df$CI_Lower <- result_df$log2FoldChange - (z_score * result_df$lfcSE)
+  result_df$CI_Upper <- result_df$log2FoldChange + (z_score * result_df$lfcSE)
+  if(!"Symbol" %in% colnames(result_df)) {
+    result_df$Symbol <- rownames(result_df)
+  }
+  metavolcano_input <- result_df %>%
+    dplyr::select(Symbol, Log2FC = log2FoldChange, pvalue, CI.Lower = CI_Lower, CI.Upper = CI_Upper)
+  return(metavolcano_input)
+}
+
+# Apply the function to each element in the results_list
+results_list_ci <- lapply(results_list, add_ci_and_prepare_for_metavolcano)
+```
+
+```{r}
+jobname <- "CMV_eg"
+dir <- paste0("/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/")
+outputfolder <- "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/output/"
+
+d <- results_list_ci
+
+meta_degs_rem <- rem_mv(diffexp=d,
+                        pcriteria="pvalue",
+                        foldchangecol='Log2FC', 
+                        genenamecol='Symbol',
+                        geneidcol=NULL,
+                        collaps=TRUE,
+                        llcol='CI.Lower',
+                        rlcol='CI.Upper',
+                        vcol=NULL, 
+                        cvar=TRUE,
+                        metathr=0.04,
+                        jobname=jobname,
+                        outputfolder=outputfolder, 
+                        draw='PDF',
+                        ncores=4)
+
+write.csv(meta_degs_rem@metaresult, paste0(outputfolder, "meta_degs_rem@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_rem@input, paste0(outputfolder, "meta_degs_rem@input.csv_", jobname, ".csv"),row.names=F)
+
+# draw_forest(remres=meta_degs_rem,
+#             gene="SELE",
+#             genecol="Symbol", 
+#             foldchangecol="Log2FC",
+#             llcol="CI.Lower", 
+#             rlcol="CI.Upper",
+#             jobname=jobname,
+#             outputfolder=outputfolder,
+#             draw="PDF")
+
+meta_degs_rem <- meta_degs_rem@metaresult
+
+meta_degs_vote <- votecount_mv(diffexp=d,
+                               pcriteria="pvalue",
+                               foldchangecol='Log2FC',
+                               genenamecol='Symbol',
+                               geneidcol=NULL,
+                               pvalue=0.05,
+                               foldchange=0, 
+                               metathr=0.04,
+                               collaps=FALSE,
+                               jobname=jobname, 
+                               outputfolder=outputfolder,
+                               draw='PDF')
+
+
+write.csv(meta_degs_vote@metaresult, paste0(outputfolder, "meta_degs_vote@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_vote@input, paste0(outputfolder, "meta_degs_vote@input_", jobname, ".csv"),row.names=F)
+
+meta_degs_comb <- combining_mv(diffexp=d,
+                               pcriteria="pvalue", 
+                               foldchangecol='Log2FC',
+                               genenamecol='Symbol',
+                               geneidcol=NULL,
+                               metafc='Mean',
+                               metathr=0.04, 
+                               collaps=TRUE,
+                               jobname=jobname,
+                               outputfolder=outputfolder,
+                               draw='PDF')
+
+write.csv(meta_degs_comb@metaresult, paste0(outputfolder, "meta_degs_comb@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_comb@input, paste0(outputfolder, "meta_degs_comb@input_", jobname, ".csv"),row.names=F)
+
+```
+
+
+```{r}
+library(tidyverse)
+# Filter based on signcon column
+filtered_data <- meta_degs_rem %>%
+  filter(abs(signcon) > 1)
+
+# Prepare the table for FGSEA
+# Assuming 'randomSummary' column contains the log2FC and you want to use it as ranks
+ranks <- filtered_data %>%
+  dplyr::select(Gene = Symbol, Rank = randomSummary) %>%
+  deframe()  # Convert to named vector
+
+hallmarks <- fgsea::gmtPathways(paste0(workingdir, "genesets/hallmark.genesets.v6.1.symbols.gmt"))
+
+results_dir <- paste0(workingdir, "results/hallmark_meta/")
+  if (!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+
+set.seed(123) # for reproducibility
+noise <- runif(length(ranks), min=-1e-10, max=1e-10)
+ranked_genes <- ranks + noise
+# Sort genes by log2FoldChange to create a ranked list
+ranked_genes_sorted <- sort(ranked_genes, decreasing = TRUE)
+fgsea_results <- fgseaMultilevel(pathways = hallmarks, stats = ranked_genes_sorted, nPermSimple = 10000)
+gsea_sig <- fgsea_results %>% dplyr::filter(pval <= 0.05) %>% dplyr::arrange(desc(NES))
+gsea_sig$pathway <- gsub("HALLMARK_", "", gsea_sig$pathway) # Remove "HALLMARK "
+gsea_sig$pathway <- tolower(gsea_sig$pathway) # Convert to lowercase
+gsea_sig$pathway <- sapply(gsea_sig$pathway, function(x) {
+  paste(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))), sep = "")
+})
+
+p <- ggplot(gsea_sig, aes(NES, pathway)) +
+      geom_point(aes(colour = pval, size = size)) +
+      scale_color_gradientn(colours = rainbow(4), limits = c(0, 0.05)) +
+      theme(panel.background = element_rect(fill = "gray95", colour = "gray95"),
+            panel.grid.major = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            panel.grid.minor = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            axis.title.y = element_blank()) +
+      expand_limits(x = c(-3, 4)) +
+      scale_x_continuous(breaks = c(-3, -2, -1, 0, 1, 2, 3, 4)) +
+      scale_y_discrete(limits = rev(gsea_sig$pathway)) +
+      ggtitle("Hallmark Pathways") +
+      geom_vline(xintercept = 0, color = "gray", linetype = "dashed")
+p    
+
+gsea_sig_filtered <- gsea_sig
+# gsea_sig_filtered <- gsea_sig[-c(3), ]
+
+# Remove rows 1, 6, 15, 17, and 18 from gsea_sig
+gsea_sig_filtered <- gsea_sig[-c(9, 11), ]
+gsea_sig_filtered$pathway <- gsub("_", " ", gsea_sig_filtered$pathway)
+
+p_filtered <- ggplot(gsea_sig_filtered, aes(NES, pathway)) +
+  geom_segment(aes(x = 0, xend = NES, y = pathway, yend = pathway), color = "gray50") +
+  geom_point(aes(colour = pval), size = 5, shape = 20) +  # Set size outside aes() and remove legend
+  scale_color_gradient(low = "darkblue", high = "lightblue", limits = c(0, 0.05)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_line(color = "gray94"),  # Add vertical gray lines
+    panel.grid.major.y = element_line(color = "gray90"),  # Add horizontal gray lines
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),  # Blank background
+    axis.title.y = element_blank(),
+    axis.line.x = element_line(color = "gray50"),  # Add x-axis line
+    plot.title = element_text(hjust = 0.5)  # Center the title
+  ) +
+  coord_cartesian(xlim = range(gsea_sig_filtered$NES, na.rm = TRUE)) +  # Set x-axis limits including negative values
+  scale_x_continuous(breaks = seq(floor(min(gsea_sig_filtered$NES)), ceiling(max(gsea_sig_filtered$NES)), by = 1)) +  # Adjust x-axis breaks
+  scale_y_discrete(limits = rev(gsea_sig_filtered$pathway)) +
+  ggtitle(paste0("Hallmark genesets ", jobname, " metaDEGs")) +
+  geom_vline(xintercept = 0, color = "gray50") 
+
+
+# Print the plot
+print(p_filtered)
+
+convert_list_to_string <- function(list_elem, sep = ";") {
+  sapply(list_elem, function(x) paste(x, collapse = sep))
+}
+
+# Apply the function to the leadingEdge column
+gsea_sig_filtered$leadingEdge <- convert_list_to_string(gsea_sig_filtered$leadingEdge)
+
+# Now write to CSV
+# write.csv(gsea_sig_filtered, paste0(workingdir, "results/hallmark_meta/", "fgsea_plot_hallmark_CMV_eg_", gsub(" ", "_", jobname), ".csv"), row.names = FALSE)
+```
+
+
+# HIV-T
+```{r}
+library(DESeq2)
+library(dplyr)
+
+results_list <- list()
+
+nt_t_samples <- sample_info %>%
+  filter(Group == "NT_T") %>%
+  pull(SampleName)
+
+hiv_t_samples <- sample_info %>%
+  filter(Group == "HIV_T") %>%
+  pull(SampleName)
+
+# Perform Differential Expression Analysis
+for (hiv_t_sample in hiv_t_samples) {
+  sample_info$custom_group <- ifelse(sample_info$SampleName == hiv_t_sample, "HIV_T",
+                                     ifelse(sample_info$SampleName %in% nt_t_samples, "NT_T", NA))
+  
+  sample_info$custom_group <- factor(sample_info$custom_group)
+  temp_sample_info <- sample_info[!is.na(sample_info$custom_group), ]
+  temp_dds <- dds[, temp_sample_info$SampleName]
+  colData(temp_dds) <- DataFrame(temp_sample_info)
+  colData(temp_dds)$custom_group <- factor(colData(temp_dds)$custom_group)
+  design(temp_dds) <- ~ custom_group
+  temp_dds <- DESeq(temp_dds)
+  results_name <- paste(hiv_t_sample, "vs_NT_T", sep = "_")
+  results_list[[results_name]] <- results(temp_dds, contrast = c("custom_group", "HIV_T", "NT_T"))
+}
+
+add_ci_and_prepare_for_metavolcano <- function(result, conf_level = 0.95) {
+  result_df <- as.data.frame(result)
+  result_df <- result_df %>% dplyr::filter(!is.na(log2FoldChange), !is.na(pvalue))
+  z_score <- qnorm((1 + conf_level) / 2)
+  result_df$CI_Lower <- result_df$log2FoldChange - (z_score * result_df$lfcSE)
+  result_df$CI_Upper <- result_df$log2FoldChange + (z_score * result_df$lfcSE)
+  if(!"Symbol" %in% colnames(result_df)) {
+    result_df$Symbol <- rownames(result_df)
+  }
+  metavolcano_input <- result_df %>%
+    dplyr::select(Symbol, Log2FC = log2FoldChange, pvalue, CI.Lower = CI_Lower, CI.Upper = CI_Upper)
+  return(metavolcano_input)
+}
+
+# Apply the function to each element in the results_list
+results_list_ci <- lapply(results_list, add_ci_and_prepare_for_metavolcano)
+```
+
+
+
+```{r}
+jobname <- "HIV_T"
+
+dir <- paste0("/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/")
+input <- "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/input/"
+outputfolder <- "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/output/"
+
+d <- results_list_ci
+
+meta_degs_rem <- rem_mv(diffexp=d,
+                        pcriteria="pvalue",
+                        foldchangecol='Log2FC', 
+                        genenamecol='Symbol',
+                        geneidcol=NULL,
+                        collaps=TRUE,
+                        llcol='CI.Lower',
+                        rlcol='CI.Upper',
+                        vcol=NULL, 
+                        cvar=TRUE,
+                        metathr=0.01,
+                        jobname=jobname,
+                        outputfolder=outputfolder, 
+                        draw='PDF',
+                        ncores=4)
+
+
+write.csv(meta_degs_rem@metaresult, paste0(outputfolder, "meta_degs_rem@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_rem@input, paste0(outputfolder, "meta_degs_rem@input.csv_", jobname, ".csv"),row.names=F)
+
+meta_degs_rem <- meta_degs_rem@metaresult
+
+# draw_forest(remres=meta_degs_rem,
+#             gene="SELE",
+#             genecol="Symbol", 
+#             foldchangecol="Log2FC",
+#             llcol="CI.Lower", 
+#             rlcol="CI.Upper",
+#             jobname=jobname,
+#             outputfolder=outputfolder,
+#             draw="PDF")
+
+meta_degs_vote <- votecount_mv(diffexp=d,
+                               pcriteria="pvalue",
+                               foldchangecol='Log2FC',
+                               genenamecol='Symbol',
+                               geneidcol=NULL,
+                               pvalue=0.05,
+                               foldchange=0, 
+                               metathr=0.01,
+                               collaps=FALSE,
+                               jobname=jobname, 
+                               outputfolder=outputfolder,
+                               draw='PDF')
+
+meta_degs_vote@MetaVolcano
+
+write.csv(meta_degs_vote@metaresult, paste0(outputfolder, "meta_degs_vote@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_vote@input, paste0(outputfolder, "meta_degs_vote@input_", jobname, ".csv"),row.names=F)
+
+
+meta_degs_comb <- combining_mv(diffexp=d,
+                               pcriteria="pvalue", 
+                               foldchangecol='Log2FC',
+                               genenamecol='Symbol',
+                               geneidcol=NULL,
+                               metafc='Mean',
+                               metathr=0.01, 
+                               collaps=TRUE,
+                               jobname=jobname,
+                               outputfolder=outputfolder,
+                               draw='PDF')
+
+write.csv(meta_degs_comb@metaresult, paste0(outputfolder, "meta_degs_comb@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_comb@input, paste0(outputfolder, "meta_degs_comb@input_", jobname, ".csv"),row.names=F)
+
+```
+
+
+```{r}
+library(DESeq2)
+library(dplyr)
+library(tidyverse)
+
+# Filter based on signcon column
+filtered_data <- meta_degs_rem %>%
+  filter(abs(signcon) > 2)
+
+# Prepare the table for FGSEA
+# Assuming 'randomSummary' column contains the log2FC and you want to use it as ranks
+ranks <- filtered_data %>%
+  dplyr::select(Gene = Symbol, Rank = randomSummary) %>%
+  deframe()  # Convert to named vector
+
+hallmarks <- fgsea::gmtPathways(paste0(workingdir, "genesets/hallmark.genesets.v6.1.symbols.gmt"))
+
+results_dir <- paste0(workingdir, "results/hallmark_meta/")
+  if (!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+
+set.seed(123) # for reproducibility
+noise <- runif(length(ranks), min=-1e-10, max=1e-10)
+ranked_genes <- ranks + noise
+# Sort genes by log2FoldChange to create a ranked list
+ranked_genes_sorted <- sort(ranked_genes, decreasing = TRUE)
+  
+# Perform FGSEA using fgseaMultilevel and handle pathways with unbalanced stats
+fgsea_results <- fgseaMultilevel(pathways = hallmarks, stats = ranked_genes_sorted, nPermSimple = 10000)
+  
+# Filter for significant pathways
+gsea_sig <- fgsea_results %>% dplyr::filter(pval <= 0.05) %>% dplyr::arrange(desc(NES))
+
+gsea_sig$pathway <- gsub("HALLMARK_", "", gsea_sig$pathway) # Remove "HALLMARK "
+gsea_sig$pathway <- tolower(gsea_sig$pathway) # Convert to lowercase
+gsea_sig$pathway <- sapply(gsea_sig$pathway, function(x) {
+  paste(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))), sep = "")
+})
+
+p <- ggplot(gsea_sig, aes(NES, pathway)) +
+      geom_point(aes(colour = pval, size = size)) +
+      scale_color_gradientn(colours = rainbow(4), limits = c(0, 0.05)) +
+      theme(panel.background = element_rect(fill = "gray95", colour = "gray95"),
+            panel.grid.major = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            panel.grid.minor = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            axis.title.y = element_blank()) +
+      expand_limits(x = c(-3, 4)) +
+      scale_x_continuous(breaks = c(-3, -2, -1, 0, 1, 2, 3, 4)) +
+      scale_y_discrete(limits = rev(gsea_sig$pathway)) +
+      ggtitle(paste0("Hallmark Pathways ", jobname, " MetaDegs")) +
+      geom_vline(xintercept = 0, color = "gray", linetype = "dashed")
+p    
+
+gsea_sig_filtered <- gsea_sig
+
+p_filtered <- ggplot(gsea_sig_filtered, aes(NES, pathway)) +
+  geom_segment(aes(x = 0, xend = NES, y = pathway, yend = pathway), color = "gray50") +
+  geom_point(aes(colour = pval), size = 5, shape = 20) +  # Set size outside aes() and remove legend
+  scale_color_gradient(low = "darkblue", high = "lightblue", limits = c(0, 0.05)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_line(color = "gray94"),  # Add vertical gray lines
+    panel.grid.major.y = element_line(color = "gray90"),  # Add horizontal gray lines
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),  # Blank background
+    axis.title.y = element_blank(),
+    axis.line.x = element_line(color = "gray50"),  # Add x-axis line
+    plot.title = element_text(hjust = 0.5)  # Center the title
+  ) +
+  coord_cartesian(xlim = range(gsea_sig_filtered$NES, na.rm = TRUE)) +  # Set x-axis limits including negative values
+  scale_x_continuous(breaks = seq(floor(min(gsea_sig_filtered$NES)), ceiling(max(gsea_sig_filtered$NES)), by = 1)) +  # Adjust x-axis breaks
+  scale_y_discrete(limits = rev(gsea_sig_filtered$pathway)) +
+  ggtitle(paste0("Hallmark genesets ", jobname, " metaDEGs")) +
+  geom_vline(xintercept = 0, color = "gray50") 
+
+# Print the plot
+print(p_filtered)
+```
+
+
+
+
+# Metavolcano
+
+HIV-eg
+
+```{r}
+library(DESeq2)
+library(dplyr)
+
+# Initialize an empty list to store DESeq2 results
+results_list <- list()
+
+nt_eg_samples <- sample_info %>%
+  filter(Group == "NT_eg") %>%
+  pull(SampleName)
+
+hiv_eg_samples <- sample_info %>%
+  filter(Group == "HIV_eg") %>%
+  pull(SampleName)
+
+# Step 2: Perform Differential Expression Analysis
+for (hiv_eg_sample in hiv_eg_samples) {
+  sample_info$custom_group <- ifelse(sample_info$SampleName == hiv_eg_sample, "HIV_eg",
+                                     ifelse(sample_info$SampleName %in% nt_eg_samples, "NT_eg", NA))
+  sample_info$custom_group <- factor(sample_info$custom_group)
+  temp_sample_info <- sample_info[!is.na(sample_info$custom_group), ]
+  temp_dds <- dds[, temp_sample_info$SampleName]
+  colData(temp_dds) <- DataFrame(temp_sample_info)
+  colData(temp_dds)$custom_group <- factor(colData(temp_dds)$custom_group)
+  design(temp_dds) <- ~ custom_group
+  temp_dds <- DESeq(temp_dds)
+  results_name <- paste(hiv_eg_sample, "vs_NT_eg", sep = "_")
+  results_list[[results_name]] <- results(temp_dds, contrast = c("custom_group", "HIV_eg", "NT_eg"))
+}
+
+add_ci_and_prepare_for_metavolcano <- function(result, conf_level = 0.95) {
+  result_df <- as.data.frame(result)
+  result_df <- result_df %>% dplyr::filter(!is.na(log2FoldChange), !is.na(pvalue))
+  z_score <- qnorm((1 + conf_level) / 2)
+  result_df$CI_Lower <- result_df$log2FoldChange - (z_score * result_df$lfcSE)
+  result_df$CI_Upper <- result_df$log2FoldChange + (z_score * result_df$lfcSE)
+  if(!"Symbol" %in% colnames(result_df)) {
+    result_df$Symbol <- rownames(result_df)
+  }
+  metavolcano_input <- result_df %>%
+    dplyr::select(Symbol, Log2FC = log2FoldChange, pvalue, CI.Lower = CI_Lower, CI.Upper = CI_Upper)
+  return(metavolcano_input)
+}
+
+# Apply the function to each element in the results_list
+results_list_ci <- lapply(results_list, add_ci_and_prepare_for_metavolcano)
+```
+
+```{r}
+jobname <- "HIV_eg"
+
+dir <- paste0("/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/")
+outputfolder <- "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/output/"
+
+d <- results_list_ci
+
+meta_degs_rem <- rem_mv(diffexp=d,
+                        pcriteria="pvalue",
+                        foldchangecol='Log2FC', 
+                        genenamecol='Symbol',
+                        geneidcol=NULL,
+                        collaps=TRUE,
+                        llcol='CI.Lower',
+                        rlcol='CI.Upper',
+                        vcol=NULL, 
+                        cvar=TRUE,
+                        metathr=0.04,
+                        jobname=jobname,
+                        outputfolder=outputfolder, 
+                        draw='PDF',
+                        ncores=4)
+
+
+write.csv(meta_degs_rem@metaresult, paste0(outputfolder, "meta_degs_rem@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_rem@input, paste0(outputfolder, "meta_degs_rem@input.csv_", jobname, ".csv"),row.names=F)
+
+# draw_forest(remres=meta_degs_rem,
+#             gene="SELE",
+#             genecol="Symbol", 
+#             foldchangecol="Log2FC",
+#             llcol="CI.Lower", 
+#             rlcol="CI.Upper",
+#             jobname=jobname,
+#             outputfolder=outputfolder,
+#             draw="PDF")
+
+meta_degs_rem <- meta_degs_rem@metaresult
+
+meta_degs_vote <- votecount_mv(diffexp=d,
+                               pcriteria="pvalue",
+                               foldchangecol='Log2FC',
+                               genenamecol='Symbol',
+                               geneidcol=NULL,
+                               pvalue=0.05,
+                               foldchange=0, 
+                               metathr=0.04,
+                               collaps=FALSE,
+                               jobname=jobname, 
+                               outputfolder=outputfolder,
+                               draw='PDF')
+
+
+write.csv(meta_degs_vote@metaresult, paste0(outputfolder, "meta_degs_vote@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_vote@input, paste0(outputfolder, "meta_degs_vote@input_", jobname, ".csv"),row.names=F)
+
+meta_degs_comb <- combining_mv(diffexp=d,
+                               pcriteria="pvalue", 
+                               foldchangecol='Log2FC',
+                               genenamecol='Symbol',
+                               geneidcol=NULL,
+                               metafc='Mean',
+                               metathr=0.04, 
+                               collaps=TRUE,
+                               jobname=jobname,
+                               outputfolder=outputfolder,
+                               draw='PDF')
+
+write.csv(meta_degs_comb@metaresult, paste0(outputfolder, "meta_degs_comb@metaresult_", jobname, ".csv"),row.names=F)
+write.csv(meta_degs_comb@input, paste0(outputfolder, "meta_degs_comb@input_", jobname, ".csv"),row.names=F)
+```
+
+
+```{r}
+library(tidyverse)
+# Filter based on signcon column
+filtered_data <- meta_degs_rem %>%
+  filter(abs(signcon) > 1)
+
+# Prepare the table for FGSEA
+# Assuming 'randomSummary' column contains the log2FC and you want to use it as ranks
+ranks <- filtered_data %>%
+  dplyr::select(Gene = Symbol, Rank = randomSummary) %>%
+  deframe()  # Convert to named vector
+
+hallmarks <- fgsea::gmtPathways(paste0(workingdir, "genesets/hallmark.genesets.v6.1.symbols.gmt"))
+
+results_dir <- paste0(workingdir, "results/hallmark_meta/")
+  if (!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+
+set.seed(123) # for reproducibility
+noise <- runif(length(ranks), min=-1e-10, max=1e-10)
+ranked_genes <- ranks + noise
+# Sort genes by log2FoldChange to create a ranked list
+ranked_genes_sorted <- sort(ranked_genes, decreasing = TRUE)
+  
+# Perform FGSEA using fgseaMultilevel and handle pathways with unbalanced stats
+fgsea_results <- fgseaMultilevel(pathways = hallmarks, stats = ranked_genes_sorted, nPermSimple = 10000)
+  
+# Filter for significant pathways
+gsea_sig <- fgsea_results %>% dplyr::filter(pval <= 0.05) %>% dplyr::arrange(desc(NES))
+
+
+gsea_sig$pathway <- gsub("HALLMARK_", "", gsea_sig$pathway) # Remove "HALLMARK "
+gsea_sig$pathway <- tolower(gsea_sig$pathway) # Convert to lowercase
+gsea_sig$pathway <- sapply(gsea_sig$pathway, function(x) {
+  paste(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))), sep = "")
+})
+
+
+p <- ggplot(gsea_sig, aes(NES, pathway)) +
+      geom_point(aes(colour = pval, size = size)) +
+      scale_color_gradientn(colours = rainbow(4), limits = c(0, 0.05)) +
+      theme(panel.background = element_rect(fill = "gray95", colour = "gray95"),
+            panel.grid.major = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            panel.grid.minor = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            axis.title.y = element_blank()) +
+      expand_limits(x = c(-3, 4)) +
+      scale_x_continuous(breaks = c(-3, -2, -1, 0, 1, 2, 3, 4)) +
+      scale_y_discrete(limits = rev(gsea_sig$pathway)) +
+      ggtitle("Hallmark Pathways") +
+      geom_vline(xintercept = 0, color = "gray", linetype = "dashed")
+p    
+
+gsea_sig_filtered <- gsea_sig
+# gsea_sig_filtered <- gsea_sig[-c(3), ]
+
+
+# Remove rows 1, 6, 15, 17, and 18 from gsea_sig
+gsea_sig_filtered <- gsea_sig[-c(9, 11), ]
+gsea_sig_filtered$pathway <- gsub("_", " ", gsea_sig_filtered$pathway)
+
+p_filtered <- ggplot(gsea_sig_filtered, aes(NES, pathway)) +
+  geom_segment(aes(x = 0, xend = NES, y = pathway, yend = pathway), color = "gray50") +
+  geom_point(aes(colour = pval), size = 5, shape = 20) +  # Set size outside aes() and remove legend
+  scale_color_gradient(low = "darkblue", high = "lightblue", limits = c(0, 0.05)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_line(color = "gray94"),  # Add vertical gray lines
+    panel.grid.major.y = element_line(color = "gray90"),  # Add horizontal gray lines
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),  # Blank background
+    axis.title.y = element_blank(),
+    axis.line.x = element_line(color = "gray50"),  # Add x-axis line
+    plot.title = element_text(hjust = 0.5)  # Center the title
+  ) +
+  coord_cartesian(xlim = range(gsea_sig_filtered$NES, na.rm = TRUE)) +  # Set x-axis limits including negative values
+  scale_x_continuous(breaks = seq(floor(min(gsea_sig_filtered$NES)), ceiling(max(gsea_sig_filtered$NES)), by = 1)) +  # Adjust x-axis breaks
+  scale_y_discrete(limits = rev(gsea_sig_filtered$pathway)) +
+  ggtitle(paste0("Hallmark genesets ", jobname, " metaDEGs")) +
+  geom_vline(xintercept = 0, color = "gray50") 
+
+
+# Print the plot
+print(p_filtered)
+
+convert_list_to_string <- function(list_elem, sep = ";") {
+  sapply(list_elem, function(x) paste(x, collapse = sep))
+}
+
+# Apply the function to the leadingEdge column
+gsea_sig_filtered$leadingEdge <- convert_list_to_string(gsea_sig_filtered$leadingEdge)
+
+# Now write to CSV
+# write.csv(gsea_sig_filtered, paste0(workingdir, "results/hallmark_meta/", "fgsea_plot_hallmark_HIV_eg_", gsub(" ", "_", jobname), ".csv"), row.names = FALSE)
+
+```
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+
+# Assuming table1 and table2 are your data frames loaded from the CSV files
+# Replace 'path_to_table1.csv' and 'path_to_table2.csv' with the actual paths of your CSV files
+tablet <- read.csv('/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/meta_degs_vote@metaresult_HIV_T.csv', stringsAsFactors = FALSE)
+tableeg <- read.csv('/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/meta_degs_vote@metaresult_HIV_eg.csv', stringsAsFactors = FALSE)
+
+# Merge the tables by the "Symbol" column
+merged_table <- merge(tablet, tableeg, by = "Symbol")
+merged_table <- merged_table[c(1:7, 12:14)]
+
+colnames(merged_table) <- c("Symbol", "HIV_T_R6", "HIV_T_R2", "HIV_T_R9", "HIV_T_R16", "HIV_T_R13", "HIV_T_R10", "HIV_eg_R21", "HIV_eg_R26","HIV_eg_R28")
+
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+
+
+status_counts <- merged_table %>%
+  pivot_longer(-Symbol, names_to = "Condition", values_to = "Status") %>%
+  filter(!is.na(Status)) %>% # Removing NAs
+  group_by(Condition, Status) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  mutate(Status = case_when(
+    Status == -1 ~ "Downregulated",
+    Status == 0 ~ "Unperturbed",
+    Status == 1 ~ "Upregulated"
+  ))
+
+status_counts$Status <- factor(status_counts$Status, levels = c("Downregulated", "Unperturbed", "Upregulated"))
+
+upregulated_label_position <- max(status_counts$Count) * 0.8  # Slightly above the highest bar
+downregulated_label_position <- max(status_counts$Count) / 4  # Slightly below the lowest bar (if negative counts)
+
+
+# svg(filename = "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/combined_plot.svg", width = 5, height = 4)
+ggplot(status_counts, aes(x = Condition, y = Count, fill = Status)) +
+  geom_bar(stat = "identity", position = position_stack(reverse = TRUE)) +
+  scale_fill_manual(values = c("Downregulated" = "#0038FF", "Unperturbed" = "grey", "Upregulated" = "#E60012")) +
+  geom_text(data = subset(status_counts, Status == "Upregulated"),
+             aes(x = Condition, label = Count),
+             y = upregulated_label_position, hjust = 0.5, color = "#E60012", size = 5) +
+  geom_text(data = subset(status_counts, Status == "Downregulated"),
+             aes(x = Condition, label = Count),
+             y = downregulated_label_position, hjust = 0.5, color = "#0038FF", size = 5) +
+  coord_flip() +
+  labs(title = "# genes",
+       x = "cells", y = "n genes") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.background = element_blank(),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"))
+# dev.off()
+
+png(filename = "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/combined_plot.png", width = 500, height = 400)
+ggplot(status_counts, aes(x = Condition, y = Count, fill = Status)) +
+  geom_bar(stat = "identity", position = position_stack(reverse = TRUE)) +
+  scale_fill_manual(values = c("Downregulated" = "#0038FF", "Unperturbed" = "grey", "Upregulated" = "#E60012")) +
+  geom_text(data = subset(status_counts, Status == "Upregulated"),
+             aes(x = Condition, label = Count),
+             y = upregulated_label_position, hjust = 0.5, color = "#E60012", size = 5) +
+  geom_text(data = subset(status_counts, Status == "Downregulated"),
+             aes(x = Condition, label = Count),
+             y = downregulated_label_position, hjust = 0.5, color = "#0038FF", size = 5) +
+  coord_flip() +
+  labs(title = "# genes",
+       x = "samples", y = "n genes") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.background = element_blank(),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"))
+dev.off()
+```
+
+
+
+```{r}
+
+# Load necessary library
+library(dplyr)
+
+# Define the paths to your files
+files <- c("/home/vivischuch/Documents/placenta_genes/only_placenta_19.tsv",
+           "/home/vivischuch/Documents/placenta_genes/group_enriched_placenta_47.tsv",
+           "/home/vivischuch/Documents/placenta_genes/tissue_enriched_placenta_67.tsv",
+           "/home/vivischuch/Documents/placenta_genes/tissue_enhanced_placenta_179.tsv",
+           "/home/vivischuch/Documents/placenta_genes/elevated_genes_placenta_293.tsv")
+
+# Names for the datasets (columns in the final table)
+dataset_names <- c("Placenta_19", "Placenta_47", "Placenta_67", "Placenta_179", "Placenta_293")
+
+# Read the files and store the presence (1) or absence (0) of genes in each dataset
+gene_presence_list <- lapply(files, function(file) {
+  genes <- read.table(file, header = TRUE, stringsAsFactors = FALSE, fill = TRUE)[,1]
+  return(genes)
+})
+
+# Assign names to the list elements
+names(gene_presence_list) <- dataset_names
+
+# Create an empty data frame to store the overlap
+gene_overlap <- data.frame(Gene = unique(unlist(gene_presence_list)))
+for(i in seq_along(gene_presence_list)) {
+  gene_overlap[[dataset_names[i]]] <- ifelse(gene_overlap$Gene %in% gene_presence_list[[i]], 1, 0)
+}
+
+colnames(gene_overlap)[1] <- "Symbol"
+
+# Define the paths to your files
+files <- c(
+  "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/meta_degs_vote@metaresult_CMV_eg.csv",
+  "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/meta_degs_vote@metaresult_CMV_T.csv",
+  "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/meta_degs_vote@metaresult_HIV_eg.csv",
+  "/home/vivischuch/Documents/RNAseq_inhouse_data/metavolcano/meta_degs_vote@metaresult_HIV_T.csv"
+)
+
+# Read the files and create a named list with the original dataframes
+dfs <- lapply(files, function(file) {
+  df <- read.csv(file, stringsAsFactors = FALSE)
+  df$Table_Name <- tools::file_path_sans_ext(basename(file))
+  return(df)
+})
+
+# Extract the names of the original dataframes
+dfs_names <- tools::file_path_sans_ext(basename(files))
+dfs_names <- sub("^meta_degs_vote@metaresult_", "", tools::file_path_sans_ext(basename(files)))
+
+# Create a named list with the original dataframes
+dfs <- setNames(dfs, dfs_names)
+
+# Assuming dfs is a list of data frames you want to merge and gene_overlap is the data frame to merge with
+# Assuming dfs is your list of dataframes and gene_overlap is the dataframe you want to merge with each one
+dfs_names <- c("CMV_eg", "CMV_T", "HIV_eg", "HIV_T") # Ensure these names match those in your list
+dfs <- setNames(dfs, dfs_names) # Name the dataframes in the list if not already named
+
+# Function to merge each dataframe in the list with gene_overlap
+merge_each_with_gene_overlap <- function(df_list, gene_df) {
+  # Initialize an empty list to store the results
+  merged_results <- list()
+  
+  # Loop through each dataframe in the list
+  for (df_name in names(df_list)) {
+    # Perform the merge operation
+    merged_df <- merge(gene_df, df_list[[df_name]], by = "Symbol", all = TRUE)
+    # Add the merged dataframe to the result list
+    merged_results[[df_name]] <- merged_df
+  }
+  
+  return(merged_results)
+}
+
+# Call the function with your list of dataframes and the gene_overlap dataframe
+merged_dfs <- merge_each_with_gene_overlap(dfs, gene_overlap)
+
+dfs_filtered <- lapply(merged_dfs, function(df) df[df$degvcount != "1.Unperturbed", ])
+
+dfs_filtered <- lapply(dfs_filtered, function(df) {
+    # Filter out rows with NA in degvcount column
+    df_filtered <- df[!is.na(df$degvcount), ]
+    return(df_filtered)
+})
+
+# Load required libraries
+library(VennDiagram)
+
+# Extract unique genes from each dataframe
+genes_list <- lapply(dfs_filtered, function(df) df$Symbol)
+
+# Find intersecting genes
+intersecting_genes <- Reduce(intersect, genes_list)
+
+# Count the number of genes in each set
+genes_counts <- sapply(genes_list, function(x) length(x))
+
+
+# png(paste0(workingdir, "venn_diagram3.png"), width = 500, height = 400) # Adjust size as needed
+venn.plot <- venn.diagram(
+  x = genes_list,
+  filename = NULL
+)
+grid.draw(venn.plot)
+# dev.off()
+
+# svg(paste0(workingdir, "venn_diagram2.svg"), width = 5, height = 4) # Adjust size as needed
+venn.plot <- venn.diagram(
+  x = genes_list,
+  filename = NULL
+)
+grid.draw(venn.plot)
+# dev.off()
+
+# Assuming dfs_filtered is a named list of your filtered dataframes, and each dataframe has the columns 'Symbol' and 'Placenta_293'
+
+# Function to extract genes not NA in Placenta_293
+extract_genes_not_na_in_placenta293 <- function(df) {
+  return(df$Symbol[!is.na(df$Placenta_293)])
+}
+
+# Apply the function to each dataframe in dfs_filtered to get genes not NA in Placenta_293 for each condition
+genes_not_na_placenta293_list <- lapply(dfs_filtered, extract_genes_not_na_in_placenta293)
+
+# Now, you'll want to find the intersection of these genes similar to how you've done before for your Venn diagram
+# For demonstration, let's assume you're working with three dataframes: CMV_eg, CMV_T, HIV_eg (adjust as necessary)
+
+# Find intersecting genes that are not NA in Placenta_293
+intersecting_genes_placenta293 <- Reduce(intersect, genes_not_na_placenta293_list)
+
+# For Venn diagram intersections - Adjust according to the actual intersections in your Venn diagram
+# Example for a 3-way Venn Diagram - Adjust based on actual data
+intersection_cmv_eg_cmv_t <- length(intersect(genes_not_na_placenta293_list$CMV_eg, genes_not_na_placenta293_list$CMV_T))
+intersection_cmv_eg_hiv_eg <- length(intersect(genes_not_na_placenta293_list$CMV_eg, genes_not_na_placenta293_list$HIV_eg))
+intersection_cmv_t_hiv_eg <- length(intersect(genes_not_na_placenta293_list$CMV_T, genes_not_na_placenta293_list$HIV_eg))
+intersection_all <- length(intersecting_genes_placenta293)
+
+# Unique genes in Placenta_293 for each condition (not part of intersections)
+unique_cmv_eg_placenta293 <- length(setdiff(genes_not_na_placenta293_list$CMV_eg, c(intersecting_genes_placenta293, genes_not_na_placenta293_list$CMV_T, genes_not_na_placenta293_list$HIV_eg)))
+unique_cmv_t_placenta293 <- length(setdiff(genes_not_na_placenta293_list$CMV_T, c(intersecting_genes_placenta293, genes_not_na_placenta293_list$CMV_eg, genes_not_na_placenta293_list$HIV_eg)))
+unique_hiv_eg_placenta293 <- length(setdiff(genes_not_na_placenta293_list$HIV_eg, c(intersecting_genes_placenta293, genes_not_na_placenta293_list$CMV_eg, genes_not_na_placenta293_list$CMV_T)))
+
+# Now you can output or use these counts as needed for your analysis or visualization
+list(
+  intersection_cmv_eg_cmv_t = intersection_cmv_eg_cmv_t,
+  intersection_cmv_eg_hiv_eg = intersection_cmv_eg_hiv_eg,
+  intersection_cmv_t_hiv_eg = intersection_cmv_t_hiv_eg,
+  intersection_all = intersection_all,
+  unique_cmv_eg_placenta293 = unique_cmv_eg_placenta293,
+  unique_cmv_t_placenta293 = unique_cmv_t_placenta293,
+  unique_hiv_eg_placenta293 = unique_hiv_eg_placenta293
+)
+# Load the VennDiagram library
+library(VennDiagram)
+
+# Define your gene lists
+CMV_eg_genes <- c("AGTR1", "ARHGAP28", "ATG9B", "ATP12A", "BMP5", "CHAT", "COL11A1", "COL15A1", 
+                  "COL21A1", "COL3A1", "COX4I2", "CYTL1", "DLK1", "DUSP9", "EGFL6", "ELOVL2",  
+                  "FBN2", "FOXI3", "GDF6", "GPC3", "HGF", "HOXA13", "HSD17B2", "LAMA2",   
+                  "LAMC3", "LARGE2", "LGR5", "MBNL3", "MEOX2", "PABPC4L", "PEG10", "PEG3",    
+                  "PITX2", "PLA2G2A", "RSPO2", "RTL1", "SEMA6D", "SLC22A11", "SLC52A1", "SLC6A4",  
+                  "SVEP1", "TBX4", "TBX5", "TCF21", "WFDC1", "WNT3A")
+CMV_T_genes <- c("CD28", "GPR34", "UBASH3B", "WARS1")
+HIV_eg_genes <- c("ADAMTS18", "ATG9B", "BMP5", "CHAT", "COL11A1", "COL15A1", "COL21A1", "COL3A1",  
+                  "COL4A1", "DLK1", "DUSP9", "EGFL6", "ELOVL2", "FBN1", "FBN2", "FOXI3",   
+                  "GDF6", "GPC3", "HGF", "HIGD1B", "HOXA13", "HSD17B2", "LAMA2", "LAMC3",   
+                  "LARGE2", "LGR5", "LIN28B", "LYPD6", "LYVE1", "MEOX2", "OR51E1", "PEG10",   
+                  "PEG3", "PITX2", "PLA2G2A", "RSPO2", "SEMA6D", "SLC22A11", "SLC6A4", "SPARC",   
+                  "SVEP1", "TBX4", "TBX5", "TCF21", "WARS1", "WFDC1")
+HIV_T_genes <- c("ADAMTS19", "AFF2", "CD300LG", "CETP", "COL11A1", "COL21A1", "VGLL1", "WARS1",   
+                 "XAGE2", "XAGE3")
+
+# Create a list of these vectors
+gene_lists <- list(CMV_eg = CMV_eg_genes, CMV_T = CMV_T_genes, HIV_eg = HIV_eg_genes, HIV_T = HIV_T_genes)
+
+# Generate the Venn diagram
+venn.plot <- venn.diagram(
+  x = gene_lists,
+  category.names = c("CMV_eg", "CMV_T", "HIV_eg", "HIV_T"),
+  output = NULL,  # This will return the plot as a grob object for plotting in R
+  filename = NULL, # Set this to a path if you want to save the image directly
+  imagetype = "png", # Choose your desired image type
+  height = 800, 
+  width = 800, 
+  resolution = 300,
+  compression = "lzw", # This is for png; use "none" for uncompressed
+  units = "px", # Pixels
+  lwd = 2, # Line width
+  col = "black", # Line color
+  fill = c("cornflowerblue", "green", "yellow", "darkorchid"), # Fill colors for the sets
+  alpha = 0.5, # Transparency of fill colors
+  # label.col = c("darkblue", "darkgreen", "orange", "darkviolet"), # Text color for the labels
+  cex = 1.5, # Font size for the labels
+  fontface = "bold", # Font face for the labels
+  cat.col = c("darkblue", "darkgreen", "orange", "darkviolet"), # Category name colors
+  cat.cex = 1.5, # Category name font size
+  cat.fontface = "bold" # Category name font face
+)
+
+# Plot the Venn diagram
+grid.draw(venn.plot)
+
+venn.plot <- venn.diagram(
+  x = gene_lists,
+  category.names = c("CMV_eg", "CMV_T", "HIV_eg", "HIV_T"),
+  output = NULL,  # This will return the plot as a grob object for plotting in R
+  filename = NULL
+)
+
+# Plot the Venn diagram
+grid.draw(venn.plot)
+
+svg(paste0(workingdir, "venn_diagram5.svg"), width = 5, height = 4) # Adjust size as needed
+venn.plot <- venn.diagram(
+  x = gene_lists,
+  category.names = c("CMV_eg", "CMV_T", "HIV_eg", "HIV_T"),
+  output = NULL,  # This will return the plot as a grob object for plotting in R
+  filename = NULL
+)
+grid.draw(venn.plot)
+dev.off()
+# Gene lists for each group
+CMV_eg_genes <- c("AGTR1", "ARHGAP28", "ATG9B", "ATP12A", "BMP5", "CHAT", "COL11A1", "COL15A1", 
+                  "COL21A1", "COL3A1", "COX4I2", "CYTL1", "DLK1", "DUSP9", "EGFL6", "ELOVL2",  
+                  "FBN2", "FOXI3", "GDF6", "GPC3", "HGF", "HOXA13", "HSD17B2", "LAMA2",   
+                  "LAMC3", "LARGE2", "LGR5", "MBNL3", "MEOX2", "PABPC4L", "PEG10", "PEG3",    
+                  "PITX2", "PLA2G2A", "RSPO2", "RTL1", "SEMA6D", "SLC22A11", "SLC52A1", "SLC6A4",  
+                  "SVEP1", "TBX4", "TBX5", "TCF21", "WFDC1", "WNT3A")
+
+CMV_T_genes <- c("CD28", "GPR34", "UBASH3B", "WARS1")
+
+HIV_eg_genes <- c("ADAMTS18", "ATG9B", "BMP5", "CHAT", "COL11A1", "COL15A1", "COL21A1", "COL3A1",  
+                  "COL4A1", "DLK1", "DUSP9", "EGFL6", "ELOVL2", "FBN1", "FBN2", "FOXI3",   
+                  "GDF6", "GPC3", "HGF", "HIGD1B", "HOXA13", "HSD17B2", "LAMA2", "LAMC3",   
+                  "LARGE2", "LGR5", "LIN28B", "LYPD6", "LYVE1", "MEOX2", "OR51E1", "PEG10",   
+                  "PEG3", "PITX2", "PLA2G2A", "RSPO2", "SEMA6D", "SLC22A11", "SLC6A4", "SPARC",   
+                  "SVEP1", "TBX4", "TBX5", "TCF21", "WARS1", "WFDC1")
+
+HIV_T_genes <- c("ADAMTS19", "AFF2", "CD300LG", "CETP", "COL11A1", "COL21A1", "VGLL1", "WARS1",   
+                 "XAGE2", "XAGE3")
+
+# Function to find shared genes between two lists
+find_shared_genes <- function(genes_list1, genes_list2, name1, name2) {
+  shared_genes <- intersect(genes_list1, genes_list2)
+  cat("Shared genes between", name1, "and", name2, ":\n")
+  print(shared_genes)
+  cat("\n")
+}
+
+# Example: Finding shared genes between HIV_eg and CMV_eg
+find_shared_genes(HIV_eg_genes, CMV_eg_genes, "HIV_eg", "CMV_eg")
+
+# You can repeat the find_shared_genes function call for any other pairs you're interested in.
+
+# Function to find shared genes between multiple lists and name the intersection
+find_shared_genes <- function(lists, names) {
+  intersect_names <- paste(names, collapse = " & ")
+  shared_genes <- Reduce(intersect, lists)
+  list(name = intersect_names, genes = shared_genes)
+}
+
+# All gene lists
+all_gene_lists <- list(CMV_eg_genes, CMV_T_genes, HIV_eg_genes, HIV_T_genes)
+all_names <- c("CMV_eg", "CMV_T", "HIV_eg", "HIV_T")
+
+# Prepare to store results
+shared_genes_list <- list()
+
+# Find shared genes for all combinations
+for (i in 1:(length(all_gene_lists) - 1)) {
+  for (j in (i + 1):length(all_gene_lists)) {
+    shared_genes_list[[length(shared_genes_list) + 1]] <- find_shared_genes(
+      lists = list(all_gene_lists[[i]], all_gene_lists[[j]]), 
+      names = c(all_names[i], all_names[j])
+    )
+    
+    # For combinations of three
+    if (j < length(all_gene_lists)) {
+      for (k in (j + 1):length(all_gene_lists)) {
+        shared_genes_list[[length(shared_genes_list) + 1]] <- find_shared_genes(
+          lists = list(all_gene_lists[[i]], all_gene_lists[[j]], all_gene_lists[[k]]), 
+          names = c(all_names[i], all_names[j], all_names[k])
+        )
+      }
+    }
+  }
+}
+
+# For all four groups together
+shared_genes_list[[length(shared_genes_list) + 1]] <- find_shared_genes(
+  lists = all_gene_lists, 
+  names = all_names
+)
+
+# Example: Print shared genes between CMV_eg and HIV_eg
+cat("Shared genes between CMV_eg and HIV_eg:\n")
+print(shared_genes_list[[1]]$genes)
+
+# To print all shared genes list, you can loop through `shared_genes_list`
+for (shared_genes_info in shared_genes_list) {
+  cat("\nShared genes for", shared_genes_info$name, ":\n")
+  print(shared_genes_info$genes)
+}
+
+
+# Function to find unique genes within a list compared to others
+find_unique_genes <- function(target_list, other_lists, target_name) {
+  # Combine all other lists into a single set of genes
+  combined_others <- Reduce(union, other_lists)
+  # Find unique genes in the target list not in the combined list
+  unique_genes <- setdiff(target_list, combined_others)
+  list(name = paste("Unique in", target_name), genes = unique_genes)
+}
+
+# All gene lists
+all_gene_lists <- list(CMV_eg_genes = CMV_eg_genes, 
+                       CMV_T_genes = CMV_T_genes, 
+                       HIV_eg_genes = HIV_eg_genes, 
+                       HIV_T_genes = HIV_T_genes)
+all_names <- names(all_gene_lists)
+
+# Prepare to store unique genes results
+unique_genes_list <- list()
+
+# Find unique genes for each group compared to others
+for (i in 1:length(all_gene_lists)) {
+  unique_genes_list[[i]] <- find_unique_genes(
+    target_list = all_gene_lists[[all_names[i]]], 
+    other_lists = all_gene_lists[names(all_gene_lists) != all_names[i]],
+    target_name = all_names[i]
+  )
+}
+
+# Print unique genes for each list
+for (unique_genes_info in unique_genes_list) {
+  cat("\nUnique genes for", unique_genes_info$name, ":\n")
+  print(unique_genes_info$genes)
+}
+
+
+
+# Show the counts of intersecting genes
+print(genes_counts)
+
+library(limma)
+
+# Extract all unique genes from the gene lists
+all_genes <- unique(unlist(genes_list))
+
+# Initialize an empty matrix with all genes as rows and gene lists as columns
+overlap_matrix_with_genes <- matrix(0, nrow = length(all_genes), ncol = length(genes_list), 
+                                    dimnames = list(all_genes, names(genes_list)))
+
+# Fill in the matrix with 1s where genes are present in each gene list
+for (i in seq_along(genes_list)) {
+  overlap_matrix_with_genes[genes_list[[i]], names(genes_list)[i]] <- 1
+}
+
+# Print the overlap matrix with genes
+print(overlap_matrix_with_genes)
+
+overlap_matrix_with_genes <- as.data.frame(overlap_matrix_with_genes)
+overlap_matrix_with_genes$Symbol <- rownames(overlap_matrix_with_genes)
+rownames(overlap_matrix_with_genes) <- NULL
+
+
+overlap_matrix_with_genes_reordered <- overlap_matrix_with_genes[, c(5, 1, 3, 2, 4)]
+
+# write.csv(overlap_matrix_with_genes_reordered, file = "overlap_matrix_placenta_genes.csv")
+
+merged_data <- merge(gene_overlap, overlap_matrix_with_genes_reordered, by.x = "Symbol", by.y = "Symbol", all.y = TRUE)
+
+# Save the merged data as a CSV file
+# write.csv(merged_data, file = "merged_data_overlap_matrix_placenta_genes.csv", row.names = FALSE)
+
+
+common_genes == gene_list
+
+# Assuming overlap_matrix is your overlap matrix
+# Subset the matrix to include only CMV_eg and HIV_eg columns
+subset_matrix <- overlap_matrix_with_genes_reordered[, c("Symbol", "CMV_eg", "HIV_eg")]
+
+# Filter the rows where both CMV_eg and HIV_eg are 1
+common_genes <- subset_matrix[subset_matrix$CMV_eg == 1 & subset_matrix$HIV_eg == 1, "Symbol"]
+
+```
+
