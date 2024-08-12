@@ -1,0 +1,1304 @@
+---
+title: "RNAseq inhouse data (early-gestation and term-gestation hofbauer cells)"
+author: "Viviane Schuch"
+date: "2024-08-08"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(DESeq2)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(fgsea)
+library(sva)
+library(umap)
+# library(maptools)
+library(ggrepel)
+library(reshape2)
+library(CEMiTool)
+library(limma)
+library(stringr)
+library(mdp)
+library(fastDummies)
+library(data.table)
+```
+
+# set workingdir
+
+```{r workingdir, message = FALSE, warning = FALSE}
+workingdir <- "/home/vivischuch/Documents/RNAseq_inhouse_data/"
+setwd(workingdir)
+```
+
+# read raw counts
+
+```{r read_counts, message = FALSE, warning = FALSE}
+counts_df <- read.table(paste0(workingdir, "counts/read_counts_mRNA.csv"), header = TRUE, sep = "\t", row.names=2)
+counts_df <- counts_df[, -c(1, 2), drop = FALSE] 
+counts_df <- counts_df[complete.cases(counts_df), ]
+counts_df <- round(counts_df)
+
+cols_to_keep <- !grepl("ZIKV_eg|ZIKV_T", names(counts_df))
+
+# Subsetting the counts_df to keep only the selected columns
+counts_df <- counts_df[, cols_to_keep]
+
+# cols_to_keep2 <- !grepl("R32|R5|R8|R16|R19|36|R35", names(counts_df))
+# counts_df <- counts_df[, cols_to_keep2]
+```
+
+# prepare the sample_info dataframe from colnames of counts_df
+
+```{r metadata, message = FALSE, warning = FALSE}
+sample_names <- colnames(counts_df)
+
+# Extract sample names and groups
+sample_info <- data.frame(
+  SampleName = sample_names,
+  stringsAsFactors = FALSE
+)
+
+# Split SampleName into four columns: Sample, Group, Category, and Data
+sample_info <- separate(sample_info, col = "SampleName", into = c("Sample", "Group", "Gestation"), sep = "_", remove = FALSE)
+
+# Extract "Read.Count" from Category and add it to the new "Data" column
+sample_info$Data_type <- gsub(".*?([^_]+$)", "\\1", sample_info$Gestation)
+
+# Remove "Read.Count" from Category
+sample_info$Gestation <- gsub(".Read.Count", "", sample_info$Gestation)
+
+# Extract everything before the first dot in the "Data" column
+sample_info$Data_type <- gsub("^[^\\.]+\\.(.*)$", "\\1", sample_info$Data_type)
+
+# Rename the "Group" column to "Stimuli"
+sample_info$Stimuli <- sample_info$Group
+
+# Create the "group" column by pasting "Group" and "Category"
+sample_info$Group <- paste0(sample_info$Group, "_", sample_info$Gestation)
+
+# head(sample_info)
+
+# Assuming counts_df is your raw counts and sample_info contains sample information
+
+sample_info <- sample_info %>%
+  mutate(Batch = case_when(
+    SampleName %in% c("R32_NT_eg.Read.Count", "R33_NT_eg.Read.Count", "R34_NT_eg.Read.Count", "R35_NT_eg.Read.Count", "R36_NT_T.Read.Count") ~ "Batch 1",
+    # SampleName %in% c("R11_CMV_T.Read.Count", "R20_CMV_T.Read.Count", "R4_CMV_T.Read.Count", "R17_CMV_T.Read.Count")  ~ "Batch 2",
+    SampleName %in% c("R14_CMV_T.Read.Count", "R21_HIV_eg.Read.Count", "R21_NT_eg.Read.Count", "R24_CMV_eg.Read.Count") ~ "Batch 3",
+    TRUE ~ "Batch 0"
+  ))
+
+sample_info$Class <- sample_info$Group
+
+sample_info <- sample_info %>% 
+  dplyr::select(Sample, Class, everything())
+
+
+sample_info <- as.data.frame(sample_info)
+sample_info$Class <- factor(sample_info$Class)
+# sample_info$Batch <- factor(sample_info$Batch, levels = c("Batch 0", "Batch 1", "Batch 2", "Batch 3"))
+sample_info$Batch <- factor(sample_info$Batch, levels = c("Batch 0", "Batch 1", "Batch 3"))
+sample_info$Group <- factor(sample_info$Group, levels = unique(sample_info$Group))
+
+library(dplyr)
+
+sample_info <- sample_info %>%
+  filter(!Class %in% c("ZIKV_eg", "ZIKV_T"))
+```
+
+# Plot Total Number of Mapped Reads per Sample
+
+```{r reads_per_sample, message = FALSE, warning = FALSE}
+# Calculate the sum of reads for each sample (column)
+total_reads_per_sample <- colSums(counts_df)
+
+# Merge and create the plot data
+plot_data <- data.frame(Sample = names(total_reads_per_sample), TotalReads = total_reads_per_sample)
+plot_data_with_group <- merge(plot_data, sample_info[, c("SampleName", "Group")], by.x = "Sample", by.y = "SampleName", all.x = TRUE)
+
+plot_data_with_group$Sample <- gsub(".Read.Count", "", plot_data_with_group$Sample, fixed = TRUE)
+# Order the data frame by 'Group'
+plot_data_with_group <- plot_data_with_group[order(plot_data_with_group$Group), ]
+
+plot_data_with_group$Group <- factor(plot_data_with_group$Group, levels = unique(plot_data_with_group$Group))
+plot_data_with_group$Sample <- factor(plot_data_with_group$Sample, levels = unique(plot_data_with_group$Sample))
+
+p1 <- ggplot(plot_data_with_group, aes(x = Sample, y = TotalReads, fill = Group)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Set1") + # You can choose different palettes
+  theme_minimal() +
+  labs(title = "Total Number of Mapped Reads per Sample", x = "Sample", y = "Total Reads") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  guides(fill = guide_legend(title = "Group"))
+
+p1
+```
+
+# create DESeqDataSet
+
+```{r create_DESeqDataSet, message = FALSE, warning = FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts_df, colData = sample_info, design = ~ Group)
+
+# Filtering and normalization
+dds <- dds[rowSums(counts(dds)) > 1, ]
+dds <- DESeq(dds)
+
+# Extract normalized counts
+exprs_norm <- counts(dds, normalized = TRUE)
+
+# Log2 transformation
+exprs_norm <- log2(exprs_norm + 1)
+```
+
+# Plot quality control before batch effect
+
+```{r quality_control_before, message = FALSE, warning = FALSE}
+ex <- as.matrix(exprs_norm)
+
+ex <- na.omit(ex) # eliminate rows with NAs
+ex <- ex[!duplicated(ex), ]  # remove duplicates
+
+# UMAP
+ump <- umap(t(ex), n_neighbors = 16, random_state = 123)
+umap_df <- data.frame(UMAP_1 = ump$layout[, 1], UMAP_2 = ump$layout[, 2], Label = rownames(ump$layout))
+umap_df$SampleName <- rownames(umap_df)
+umap_df <- umap_df %>%
+  left_join(sample_info, by = "SampleName") %>%
+  select(UMAP_1, UMAP_2, Label, Group, Batch)
+
+# umap_df$Label <- gsub(".Read.Count", "",umap_df$Label, fixed = TRUE)
+# colnames(ex) <- gsub(".Read.Count", "", colnames(ex), fixed = TRUE)
+
+# Make sure 'Batch' is a factor and its levels are in the order you want
+
+umap_df$Batch <- factor(umap_df$Batch, levels = c("Batch 0" , "Batch 1", "Batch 2", "Batch 3"))
+color_vector <- (c("#1B9E77", "#7570B3", "#E7298A", "#E6AB02"))
+# UMAP plot (dimensionality reduction)
+ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, color = Batch)) +  # Use Group for color
+  geom_point() + 
+  geom_text_repel(aes(label = Label, color = Batch), size = 3, box.padding = 0.35, point.padding = 0.5, segment.color = NA) +
+  theme_minimal() +
+  scale_color_manual(values = color_vector) +  # Use the same color vector as boxplot
+  labs(title = "UMAP plot, nbrs=14, before batch correction", x = "", y = "") +
+  theme(legend.title = element_text(size = 12), legend.text = element_text(size = 6)) +
+  theme(legend.position = "bottom")
+
+# box-and-whisker plot
+
+par(mar=c(7, 4, 2, 1) + 0.1)
+par(cex.axis=0.6)
+ord <- order(sample_info$Batch)  # order samples by group
+color_vector <- (c("#1B9E77", "#7570B3", "#E7298A", "#E6AB02"))
+palette(color_vector)
+title <- "before batch correction"
+boxplot(ex[,ord], boxwex=0.6, notch=TRUE, main=title, outline=FALSE, las=2, col=sample_info$Batch[ord])
+legend("topleft",
+       legend = levels(sample_info$Batch),
+       fill = color_vector[1:length(levels(sample_info$Batch))],
+       cex = 0.8)   
+
+
+dir.create(paste0(workingdir, "results"))
+
+# expression value distribution
+
+par(mar=c(4,4,2,1))
+title <- "value distribution, before batch correction"
+plotDensities(ex, group=sample_info$Batch, main=title, legend ="topright")
+```
+
+# remove batch effect using combat package
+
+```{r remove_batch, message = FALSE, warning = FALSE}
+# Step 1: Identify uniformly expressed genes within each batch
+batch_info <- sample_info$Batch
+uniform_genes <- lapply(unique(batch_info), function(batch) {
+  batch_indices <- which(batch_info == batch)
+  batch_data <- exprs_norm[, batch_indices]
+  
+  apply(batch_data, 1, function(gene_expression) {
+    length(unique(gene_expression)) == 1
+  })
+})
+
+# Step 2: Aggregate uniformly expressed genes across batches
+uniform_genes_matrix <- do.call(cbind, uniform_genes)
+uniformly_expressed_any_batch <- apply(uniform_genes_matrix, 1, any)
+
+# Step 3: Exclude identified genes
+exprs_filtered <- exprs_norm[!uniformly_expressed_any_batch, ]
+
+# Display before and after filtering
+dim(exprs_norm) # Before
+# [1] 18198    30
+dim(exprs_filtered) # After
+# [1] 16926    30
+
+# combat
+exprs_norm_batch_corrected <- ComBat(dat = exprs_filtered, batch = sample_info$Batch, mod = NULL, par.prior = TRUE, prior.plots = FALSE)
+```
+
+# Plot quality control after batch correction
+
+```{r quality_control_after, message = FALSE, warning = FALSE}
+ex <- as.matrix(exprs_norm_batch_corrected)
+
+ex <- na.omit(ex)
+ex <- ex[!duplicated(ex), ]
+
+ump <- umap(t(ex), n_neighbors = 10, random_state = 123)
+
+umap_df <- data.frame(UMAP_1 = ump$layout[, 1], UMAP_2 = ump$layout[, 2], Label = rownames(ump$layout))
+
+umap_df$SampleName <- rownames(umap_df)
+umap_df <- umap_df %>%
+  left_join(sample_info, by = "SampleName") %>%
+  select(UMAP_1, UMAP_2, Label, Group, Batch)
+
+# umap_df$Label <- gsub(".Read.Count", "",umap_df$Label, fixed = TRUE)
+# colnames(ex) <- gsub(".Read.Count", "", colnames(ex), fixed = TRUE)
+
+# box-and-whisker plot
+
+par(mar=c(7, 4, 2, 1) + 0.1)
+par(cex.axis=0.6)
+ord <- order(sample_info$Batch)
+palette(c("#1B9E77", "#7570B3", "#E7298A", "#E6AB02"))
+title <- "after batch correction"
+boxplot(ex[,ord], boxwex=0.6, notch=TRUE, main=title, outline=FALSE, las=2, col=sample_info$Batch[ord])
+legend("topleft",                                    # Position of the legend
+       legend = levels(sample_info$Batch),           # Labels for each batch
+       fill = color_vector[1:length(levels(sample_info$Batch))],  # Match colors to batches correctly
+       cex = 0.7)   
+
+## UMAP plot
+
+ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, color = Batch)) +  # Use Group for color
+  geom_point() + 
+  geom_text_repel(aes(label = Label, color = Batch), size = 3, box.padding = 0.35, point.padding = 0.5, segment.color = NA) +
+  theme_minimal() +
+  scale_color_manual(values = color_vector) +  # Use the same color vector as boxplot
+  labs(title = "UMAP plot, nbrs=14, after batch correction", x = "", y = "") +
+  theme(legend.title = element_text(size = 12), legend.text = element_text(size = 10)) +
+  theme(legend.position = "bottom")
+
+# expression value distribution
+
+par(mar=c(4,4,2,1))
+title <- "value distribution, after batch correction"
+plotDensities(ex, group=sample_info$Batch, main=title, legend ="topright")
+```
+
+```{r}
+
+```
+
+
+# set the comparisons tables
+
+```{r comparisons, message = FALSE, warning = FALSE}
+exprs_norm <- exprs_norm_batch_corrected
+
+# by convention, contrasts are often set with the control condition first.
+
+# comparisons <- c("NT_T_vs_HIV_T", "NT_T_vs_CMV_T", "HIV_T_vs_CMV_T", "NT_eg_vs_HIV_eg", "NT_eg_vs_CMV_eg",
+#                  "HIV_eg_vs_CMV_eg", "NT_T_vs_NT_eg", "HIV_T_vs_HIV_eg", "CMV_T_vs_CMV_eg", "NT_T_vs_HIV_eg",
+#                  "NT_T_vs_CMV_eg", "HIV_T_vs_NT_eg", "HIV_T_vs_CMV_eg", "CMV_T_vs_NT_eg", "CMV_T_vs_HIV_eg",
+#                  "NT_T_vs_ZIKV_T", "HIV_T_vs_ZIKV_T", "CMV_T_vs_ZIKV_T", "NT_eg_vs_ZIKV_eg", "HIV_eg_vs_ZIKV_eg",
+#                  "CMV_eg_vs_ZIKV_eg", "ZIKV_T_vs_ZIKV_eg", "NT_T_vs_ZIKV_eg", "HIV_T_vs_ZIKV_eg",
+#                  "CMV_T_vs_ZIKV_eg", "ZIKV_T_vs_NT_eg", "ZIKV_T_vs_HIV_eg", "ZIKV_T_vs_CMV_eg")
+
+comparisons <- c("NT_T_vs_HIV_T",
+                 "NT_eg_vs_HIV_eg",
+                 "NT_T_vs_CMV_T",
+                 "NT_eg_vs_CMV_eg")
+
+# Initialize an empty list to store dataframes for each comparison
+comparison_list <- list()
+
+for (comp in comparisons) {
+  # Correctly extract test and control groups from the comparison name
+  parts <- strsplit(comp, "_vs_")[[1]]
+  test <- parts[2]
+  control <- parts[1]
+  
+  # Get the sample names for each group
+  test_group <- sample_info$SampleName[sample_info$Group == test]
+  control_group <- sample_info$SampleName[sample_info$Group == control]
+  
+  # Create a dataframe for the comparison with initial Class assignment as 'No'
+  comp_df <- data.frame(SampleName = sample_info$SampleName, Class = "No", stringsAsFactors = FALSE)
+  
+  # Assign 'test' to test samples
+  comp_df$Class[comp_df$SampleName %in% test_group] <- "test"
+  
+  # Assign 'control' to control samples
+  comp_df$Class[comp_df$SampleName %in% control_group] <- "control"
+  
+  # Add the dataframe to the list with the comparison name as the key
+  comparison_list[[comp]] <- comp_df
+}
+
+# To check the test and control samples for a specific comparison
+# example_comparison <- comparisons[1]
+# print(paste("Checking samples for:", example_comparison))
+# print(comparison_list[[example_comparison]])
+
+dds$Group <- factor(dds$Group)
+
+# head(comparison_list)
+
+# save tables
+for (comparison_name in names(comparison_list)) {
+  comparison_table <- comparison_list[[comparison_name]]
+  
+  dir_path <- paste0(workingdir, "comparisons/")
+  # Check if the directory already exists before creating it
+  if (!dir.exists(dir_path)) {
+    dir.create(dir_path)
+  }
+  # Specify the file path for each comparison
+  file_path <- paste0(dir_path, comparison_name, ".tsv")
+  # Save the table as a TSV file
+  write.table(comparison_table, file = file_path, quote = FALSE, sep = "\t", row.names = FALSE)
+}
+
+```
+
+
+# differential analysis
+
+```{r differential_analysis, message = FALSE, warning = FALSE}
+# head(result_list_deseq)
+
+result_list_deseq <- list()
+
+# by convention, contrasts are often set with the control condition first.
+for (comp in comparisons) {
+  tryCatch({
+      # Extract control and test groups from the comparison name
+      parts <- strsplit(comp, "_vs_")[[1]]
+      control <- parts[1]
+      test <- parts[2]
+      # Define the contrast
+      contrast <- c("Group", control, test)  # Assuming "Group" is the column in colData used for grouping
+      
+# results(dds, contrast=c("condition","C","B")) meaning genes with logFC > 0 are overexpressed in C.
+      # Perform differential expression analysis
+      res <- results(dds, contrast = contrast)
+      # Store the result in the list
+      result_list_deseq[[comp]] <- res
+  }, error = function(e) {
+    # If there's an error, give a message and store NULL for that comparison
+    message("Error in comparison ", comp, ": ", e$message)
+    result_list_deseq[[comp]] <- NULL
+  })
+}
+
+# Access the results using names
+# print(head(result_list_deseq[["NT_T_vs_HIV_T"]]))  # Replace "HIV_T_vs_NT_T" with the actual comparison name
+```
+
+
+```{r}
+plot_list <- list()
+
+# Loop through each comparison in result_list_deseq
+for (comparison_name in names(result_list_deseq)) {
+  # Extract data for the current comparison
+  top_genes <- result_list_deseq[[comparison_name]]
+  
+  # Creating a data frame for ggplot
+  volcano_data <- data.frame(
+    Gene = rownames(top_genes),
+    LogFC = top_genes$log2FoldChange,
+    AdjPVal = -log10(top_genes$padj),
+    Significance = ifelse(top_genes$padj < 0.05 & abs(top_genes$log2FoldChange) > 2, "Significant", "Not Significant")
+  )
+
+    # Calculate the number of upregulated and downregulated genes, excluding NAs
+  num_upregulated <- sum(volcano_data$Significance == "Significant" & volcano_data$LogFC > 2, na.rm = TRUE)
+  num_downregulated <- sum(volcano_data$Significance == "Significant" & volcano_data$LogFC < -2, na.rm = TRUE)
+
+  # Add a new column for color coding
+  volcano_data$Color <- with(volcano_data, ifelse(Significance == "Significant" & LogFC > 1, "Red",
+                                                  ifelse(Significance == "Significant" & LogFC < -1, "Blue", "Grey")))
+  modified_comparison_name <- gsub("_", " ", comparison_name)
+  # Create the volcano plot
+  plot <- ggplot(volcano_data, aes(x = LogFC, y = AdjPVal)) +
+    geom_point(aes(color = Color), alpha = 0.5) +
+    scale_color_manual(values = c("Red" = "red", "Blue" = "blue", "Grey" = "grey")) +
+    geom_vline(xintercept = c(-1, 1), col = "grey") +
+    geom_hline(yintercept = -log10(0.05), col = "grey") +
+    theme_minimal() +
+    labs(title = paste(modified_comparison_name, "\nDown: ", num_downregulated, " Up: ", num_upregulated), x = "Log2 Fold Change", y = "-Log10 Adjusted P-value") +
+    theme(legend.position = "none") +  # Hide the legend
+    scale_x_continuous(limits = c(min(volcano_data$LogFC), max(volcano_data$LogFC))) +
+    scale_y_continuous(limits = c(min(volcano_data$AdjPVal), max(volcano_data$AdjPVal)))
+  
+  # Store the plot in the list
+  plot_list[[comparison_name]] <- plot
+}
+
+# Combine the plots in a grid
+grid_plot <- wrap_plots(plot_list, ncol = 2)
+
+# Print the combined grid plot
+print(grid_plot)
+```
+
+
+# filter DE results based on the thresholds and plot results
+
+```{r number_DEGs, message = FALSE, warning = FALSE}
+
+# Set the adjusted p-value cutoff
+padj_cutoff <- 0.05
+log2fc_threshold <- 2  # Set the desired log2FC threshold
+
+# Function to filter DE results based on thresholds
+filter_DE_results <- function(results, log2fc_threshold, padj_cutoff) {
+  return(results[!is.na(results$padj) & abs(results$log2FoldChange) >= log2fc_threshold & results$padj <= padj_cutoff, ])
+}
+
+# Initialize variables to store counts
+upregulated_counts <- numeric(length(comparisons))
+downregulated_counts <- numeric(length(comparisons))
+
+# Loop through each comparison using result_list_deseq
+for (i in seq_along(comparisons)) {
+  comp <- comparisons[i]
+  # Use previously stored DESeq2 results
+  res <- result_list_deseq[[comp]]
+  # Filter results based on adjusted p-value (FDR) and log2FC thresholds
+  res_filtered <- filter_DE_results(res, log2fc_threshold, padj_cutoff)
+  # Count upregulated and downregulated genes
+  upregulated_counts[i] <- sum(res_filtered$log2FoldChange > 0, na.rm = TRUE)
+  downregulated_counts[i] <- sum(res_filtered$log2FoldChange < 0, na.rm = TRUE)
+}
+
+# Create a data frame with counts
+counts_df1 <- data.frame(
+  Comparison = comparisons,
+  Upregulated = upregulated_counts,
+  Downregulated = downregulated_counts
+)
+
+# Melt the data frame for plotting
+counts_melted <- melt(counts_df1, id.vars = "Comparison", variable.name = "Direction", value.name = "Count")
+
+# Adjust Comparison column for plotting
+counts_melted$Comparison <- gsub("_", " ", counts_melted$Comparison)
+offset <- 100  # Adjust this value as needed
+
+
+counts_melted$Comparison <- factor(counts_melted$Comparison, levels = unique(counts_melted$Comparison))
+
+gg1 <- ggplot(counts_melted, aes(x = Comparison, y = Count)) +
+  geom_bar(data = subset(counts_melted, Direction == "Upregulated"), 
+           aes(fill = "Upregulated"), stat = "identity", position = "identity") +
+  geom_bar(data = subset(counts_melted, Direction == "Downregulated"), 
+           aes(y = -Count, fill = "Downregulated"), stat = "identity", position = "identity") +
+  scale_fill_manual(values = c("Upregulated" = "red", "Downregulated" = "blue")) +
+  labs(title = "Divergent BarPlot of DEGs", x = "Comparison", y = "DEGs") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.background = element_rect(fill = "white"), # Ensure plot panel background is white
+        plot.background = element_rect(fill = "white")) + # Ensure entire plot background is white
+  geom_text(data = subset(counts_melted, Direction == "Upregulated"),
+            aes(label = Count, y = Count + ifelse(Count > offset, offset/2, offset/4)),
+            position = position_dodge(width = 0.9),
+            vjust = 0, color = "black", size = 3) +
+  geom_text(data = subset(counts_melted, Direction == "Downregulated"),
+            aes(label = Count, y = -Count - ifelse(Count > offset, offset/2, offset/4)),
+            position = position_dodge(width = 0.9),
+            vjust = 1, color = "black", size = 3) +
+  ylim(c(-max(abs(counts_melted$Count)) - offset, max(abs(counts_melted$Count)) + offset)) +
+  guides(fill = guide_legend(title = "Number of DEGs", reverse = TRUE))
+
+# Display the plot
+print(gg1)
+
+# Initialize an empty list to store filtered results
+filtered_results_list <- list()
+
+# Iterate over the results list and apply filtering
+for (name in names(result_list_deseq)) {
+  # Convert DESeqResults to a data frame and add rownames as a column
+  df_with_gene_symbol <- as.data.frame(result_list_deseq[[name]]) %>%
+    tibble::rownames_to_column(var = "GeneSymbol")
+  
+  # Apply filtering, add direction, and add comparison name
+  final_df_with_gene_symbol <- df_with_gene_symbol %>%
+    filter(padj <= padj_cutoff, abs(log2FoldChange) >= log2fc_threshold) %>%
+    mutate(Direction = ifelse(log2FoldChange > 0, "Upregulated", "Downregulated"),
+           Comparison = name)
+  
+  # Store the final dataframe in the new list
+  filtered_results_list[[name]] <- final_df_with_gene_symbol
+}
+
+print(names(result_list_deseq))
+print(names(filtered_results_list))
+
+
+output_dir <- paste0(workingdir, "DEGS/")
+
+# Check if the output directory exists; if not, create it
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Iterate over the filtered_results_list to save each table
+
+for (name in names(filtered_results_list)) {
+  # Make sure 'name' reflects the comparison accurately
+  # Define the file name with the correct comparison name
+  filename <- paste0(output_dir, name, "_DEG_padj05_fc2.csv")
+  
+  # Save the filtered result as a CSV file
+  write.csv(filtered_results_list[[name]], filename, row.names = FALSE)
+}
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+workingdir1 <- paste0(workingdir, "DEGS/")  # Append "DEGS/" only once
+
+# List of comparison names based on your saved files
+comparisons <- c("NT_eg_vs_CMV_eg", "NT_T_vs_CMV_T", "NT_eg_vs_HIV_eg", "NT_T_vs_HIV_T")
+
+# Initialize an empty data frame to store combined results
+combined_results <- data.frame(Comparison = character(), Direction = character(), Count = integer())
+
+# Loop through each comparison, load the data, and aggregate counts
+for (comp in comparisons) {
+  # Construct the file path
+  file_path <- paste0(workingdir1, comp, "_DEG_padj05_fc2.csv")
+  
+  # Load the data
+  data <- read.csv(file_path)
+  
+  # Count upregulated and downregulated genes
+  upregulated_count <- nrow(data[data$Direction == "Upregulated", ])
+  downregulated_count <- nrow(data[data$Direction == "Downregulated", ])
+  
+  # Combine counts into a temporary data frame
+  temp_df <- data.frame(Comparison = rep(comp, 2),
+                        Direction = c("Upregulated", "Downregulated"),
+                        Count = c(upregulated_count, downregulated_count))
+  
+  # Bind the temporary data frame to the combined results
+  combined_results <- rbind(combined_results, temp_df)
+}
+
+# Convert Comparison to a factor with levels in the same order as your files
+combined_results$Comparison <- factor(combined_results$Comparison, levels = comparisons)
+
+# Create the divergent plot
+ggplot(combined_results, aes(x = Comparison, y = Count, fill = Direction)) +
+  geom_bar(data = subset(combined_results, Direction == "Upregulated"), 
+           stat = "identity") +
+  geom_bar(data = subset(combined_results, Direction == "Downregulated"), 
+           stat = "identity", aes(y = -Count)) +
+  scale_fill_manual(values = c("Upregulated" = "red", "Downregulated" = "blue")) +
+  coord_flip() +
+  labs(title = "Divergent Bar Plot of DEGs", x = "Comparison", y = "Number of Genes") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(fill = guide_legend(title = "Gene Direction"))
+
+```
+
+
+
+```{r}
+# Define the pairs of comparisons
+comparison_pairs <- list(
+  c("NT_T_vs_HIV_T", "NT_eg_vs_HIV_eg",
+    "NT_T_vs_CMV_T", "NT_eg_vs_CMV_eg"))
+
+# Initialize a list to store the results data frames for each comparison pair
+results_dfs <- list()
+
+# Loop through each pair of comparisons
+for (pair in comparison_pairs) {
+  # Extract data frames for both comparisons
+  df1 <- filtered_results_list[[pair[1]]]
+  df2 <- filtered_results_list[[pair[2]]]
+  
+  # Get unique gene symbols from both data frames
+  genes1 <- unique(df1$GeneSymbol)
+  genes2 <- unique(df2$GeneSymbol)
+  
+  # Identify shared and unique genes
+  shared_genes <- intersect(genes1, genes2)
+  unique_genes1 <- setdiff(genes1, genes2)
+  unique_genes2 <- setdiff(genes2, genes1)
+  
+  # Create a data frame to store the comparison results
+  comparison_df <- data.frame(GeneSymbol = character(),
+                            Presence = character(),
+                            DirectionConsistency = character(),
+                            stringsAsFactors = FALSE)
+  
+  # Add shared genes
+  for (gene in shared_genes) {
+    direction1 <- df1$Direction[df1$GeneSymbol == gene]
+    direction2 <- df2$Direction[df2$GeneSymbol == gene]
+    
+    comparison_df <- rbind(comparison_df, data.frame(
+      GeneSymbol = gene,
+      ComparisonPair = paste(pair, collapse = " & "),
+      Presence = "Shared",
+      DirectionConsistency = ifelse(direction1 == direction2, "Same", "Opposite"),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Add unique genes from the first comparison
+  for (gene in unique_genes1) {
+    comparison_df <- rbind(comparison_df, data.frame(
+      GeneSymbol = gene,
+      ComparisonPair = paste(pair, collapse = " & "),
+      Presence = paste("Unique in", pair[1]),
+      DirectionConsistency = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Add unique genes from the second comparison
+  for (gene in unique_genes2) {
+    comparison_df <- rbind(comparison_df, data.frame(
+      GeneSymbol = gene,
+      ComparisonPair = paste(pair, collapse = " & "),
+      Presence = paste("Unique in", pair[2]),
+      DirectionConsistency = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Store the comparison data frame in the results list
+  results_dfs[[paste(pair, collapse = " & ")]] <- comparison_df
+}
+
+# Directory where you want to save the files
+output_dir <-paste0(workingdir, "shared_genes/") 
+
+# Check if the output directory exists; if not, create it
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Loop through the list of data frames
+for (comparison_name in names(results_dfs)) {
+  # Generate a filename based on the comparison name
+  file_name <- paste0(gsub(" & ", "_vs_", comparison_name), ".csv") # Replace spaces and '&' with underscores and '.csv'
+  file_path <- file.path(output_dir, file_name) # Create the full file path
+  
+  # Save the data frame to a CSV file
+  write.csv(results_dfs[[comparison_name]], file_path, row.names = FALSE)
+}
+```
+
+```{r}
+library(VennDiagram)
+library(grid) # For grid.draw()
+
+df <- results_dfs[[1]]
+
+shared_genes <- df$GeneSymbol[df$Presence == "Shared"]
+unique_NT_T_vs_HIV_T_genes <- df$GeneSymbol[df$Presence == "Unique in NT_T_vs_HIV_T"]
+unique_NT_eg_vs_HIV_eg_genes <- df$GeneSymbol[df$Presence == "Unique in NT_eg_vs_HIV_eg"]
+
+# Prepare the list for the Venn diagram
+venn_list <- list(
+  `NT_T_vs_HIV_T` = union(shared_genes, unique_NT_T_vs_HIV_T_genes),
+  `NT_eg_vs_HIV_eg` = union(shared_genes, unique_NT_eg_vs_HIV_eg_genes)
+)
+
+
+# Open PNG device
+png(paste0(workingdir, "venn_diagram1.png"), width = 500, height = 400) # Adjust size as needed
+
+# pdf("venn_diagram1.pdf", width=5, height=4)
+venn.plot <- venn.diagram(
+  x = venn_list,
+  filename = NULL, # Use NULL to plot directly to the R plotting window
+  category.names = c("NT_T_vs_HIV_T", "NT_eg_vs_HIV_eg"),
+  output = TRUE, # Allows for plotting directly
+  # Customization options
+  fill = c("#E41A1C", "#377EB8"), # Fill colors for each set
+  alpha = 0.5, # Transparency of colors
+  cex = 2, # Font size for numbers
+  fontface = "bold", # Font style
+  cat.cex = 1.5, # Font size for category names
+  cat.fontface = "bold", # Font style for category names
+  cat.col = c("#E41A1C", "#377EB8"), # Color for category names
+  cat.default.pos = "outer", # Adjust this to place category names outside
+  cat.pos = c(-20, 20), # Adjust these angles to position your labels outside and around the diagram
+  cat.dist = 0.1, # Adjust this distance to move labels further from the center if needed
+  margin = 0.1 # Margin around the plot
+)
+grid.draw(venn.plot)
+# dev.off()
+```
+
+
+
+
+
+```{r}
+# Gene of interest
+gene_of_interest <- "IL11RA"
+
+# Initialize a data frame to store log fold change for each comparison
+gene_comparison_data <- data.frame(
+  Comparison = character(),
+  LogFoldChange = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Extract log fold change values
+for (name in names(result_list_deseq)) {
+  # Convert DESeqResults to data frame
+  df <- as.data.frame(result_list_deseq[[name]])
+  
+  # Check if gene_of_interest is in this comparison
+  if (gene_of_interest %in% rownames(df)) {
+    log_fold_change <- df$log2FoldChange[rownames(df) == gene_of_interest]
+    gene_comparison_data <- rbind(gene_comparison_data, data.frame(Comparison = name, LogFoldChange = log_fold_change))
+  } else {
+    # If gene is not present in the comparison, add NA or some indicator if preferred
+    gene_comparison_data <- rbind(gene_comparison_data, data.frame(Comparison = name, LogFoldChange = NA))
+  }
+}
+
+
+gene_comparison_data$Comparison <- factor(gene_comparison_data$Comparison, 
+  levels = rev(c("NT_T_vs_HIV_T", "NT_eg_vs_HIV_eg", 
+             "NT_T_vs_CMV_T", "NT_eg_vs_CMV_eg",
+             "NT_T_vs_NT_eg")))
+
+gene_comparison_data <- gene_comparison_data[!is.na(gene_comparison_data$Comparison), ]
+# Add a 'Group' column for coloring
+gene_comparison_data$Group <- with(gene_comparison_data, ifelse(grepl("HIV", Comparison), "HIV",
+                                                                ifelse(grepl("CMV", Comparison), "CMV",
+                                                                       ifelse(grepl("ZIKV", Comparison), "ZIKV", "NT"))))
+
+library(RColorBrewer)
+# Display the palette
+my_palette <- brewer.pal(n = 4, name = "Set1")
+
+gene1 <- ggplot(gene_comparison_data, aes(x = Comparison, y = LogFoldChange, color = Group)) +
+  geom_segment(aes(x = Comparison, xend = Comparison, y = 0, yend = LogFoldChange)) +  # Removed 'color = "gray"'
+  geom_point(size = 3) +
+  scale_color_manual(values = my_palette) +
+  coord_flip() +
+  labs(title = paste0("Log2 Fold Change for Gene ", gene_of_interest, " across Comparisons"),
+       x = "Comparison", y = "Log2 Fold Change") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.background = element_rect(fill = "white"), # Set the plot panel background to white
+    plot.background = element_rect(fill = "white") # Set the entire plot background to white
+  )
+
+gene1
+```
+
+
+```{r fgsea_hallmark, message = FALSE, warning = FALSE}
+# Loading gene sets
+hallmarks <- fgsea::gmtPathways(paste0(workingdir, "genesets/hallmark.genesets.v6.1.symbols.gmt"))
+
+results_dir <- paste0(workingdir, "results/hallmark/")
+  if (!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+
+# Initialize an empty list to store FGSEA results
+fgsea_results_list <- list()
+
+# Loop through each comparison using the results stored in 'result_list_deseq'
+for (comp in names(result_list_deseq)) {
+  # Use the stored DESeq2 result for the current comparison
+  res <- result_list_deseq[[comp]]
+  # Prepare a ranked list of genes for FGSEA
+  ranked_genes <- res$log2FoldChange
+  names(ranked_genes) <- rownames(res)
+  # Break ties by adding a small amount of noise
+  set.seed(123) # for reproducibility
+  noise <- runif(length(ranked_genes), min=-1e-10, max=1e-10)
+  ranked_genes <- ranked_genes + noise
+  # Sort genes by log2FoldChange to create a ranked list
+  ranked_genes_sorted <- sort(ranked_genes, decreasing = TRUE)
+  
+  # Perform FGSEA using fgseaMultilevel and handle pathways with unbalanced stats
+  fgsea_results <- fgseaMultilevel(pathways = hallmarks, stats = ranked_genes_sorted, nPermSimple = 10000)
+  
+  # Filter for significant pathways
+  gsea_sig <- fgsea_results %>% dplyr::filter(padj <= 0.05) %>% dplyr::arrange(desc(NES))
+  # Store the FGSEA result in the list
+  fgsea_results_list[[comp]] <- gsea_sig
+}
+
+
+dfList_up <- list()
+
+dfList <- fgsea_results_list
+
+# Assuming dfList is your list of dataframes
+for (i in seq_along(dfList)) {
+  name <- names(dfList)[i]
+  module <- as.data.frame(dfList[[i]])
+  # Select columns from module
+  topmodule <- module[, c(1, 3, 5, 6, 8)]
+  # Add a new column with -log10(padj)
+  topmodule$minuslogadjpvalue <- -log10(topmodule$padj)
+  # Rename the first column to "pathways"
+  colnames(topmodule)[1] <- "pathways"
+  # Count the number of genes in the leadingEdge column and create a new column "size"
+  topmodule$size <- sapply(strsplit(as.character(topmodule$leadingEdge), ", "), length)
+  topmodule <- topmodule %>%
+    mutate(group = 1)
+  # Assign the modified dataframe to dfList_up with the same name
+  dfList_up[[name]] <- topmodule
+}
+
+# Initialize an empty list to store fgsea results
+fgsea_list <- list()
+
+# Loop through each dataframe in dfList_up
+for (name in names(dfList_up)) {
+  # Use tryCatch to handle errors
+  tryCatch({
+    # Extract the dataframe
+    topPathways <- dfList_up[[name]]
+    # Plot fgsea results for each cell
+    p <- ggplot(topPathways, aes(NES, pathways)) +
+      geom_point(aes(colour = padj, size = size)) +
+      scale_color_gradientn(colours = rainbow(4), limits = c(0, 0.05)) +
+      theme(panel.background = element_rect(fill = "gray95", colour = "gray95"),
+            panel.grid.major = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            panel.grid.minor = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            axis.title.y = element_blank()) +
+      expand_limits(x = c(-3, 4)) +
+      scale_x_continuous(breaks = c(-3, -2, -1, 0, 1, 2, 3, 4)) +
+      scale_y_discrete(limits = rev(topPathways$pathways)) +
+      ggtitle(paste0(name, " Hallmark Pathways")) +
+      geom_vline(xintercept = 0, color = "gray", linetype = "dashed")
+    
+    # Save the plot
+    # ggsave( paste0(workingdir, "results/hallmark/", "fgsea_plot_hallmarks_", gsub(" ", "_", name), ".svg"), plot = p, device = "svg")
+  }, error = function(e) {
+    # This is executed in case of an error
+    message("An error occurred in ", name, ": ", e$message)
+  })
+}
+
+# Consolidate pathways across all cells
+consolidated_pathways <- do.call("rbind", lapply(names(dfList_up), function(x) {
+  df <- dfList_up[[x]] %>%
+    mutate(group = x) %>%
+    dplyr::select(pathways, group, NES, size)
+}))
+
+consolidated_pathways <- consolidated_pathways %>%
+  mutate(
+    row = row_number(),
+    # pathways = str_replace_all(pathways, "HALLMARK_", ""),  # Remove "HALLMARK_" prefix
+    pathways = str_replace_all(pathways, "_", " "),  # Replace underscores with spaces in pathways
+    group = str_replace_all(group, "_", " ")  # Replace underscores with spaces in group
+  )
+
+consolidated_pathways$group <- factor(consolidated_pathways$group, levels = unique(consolidated_pathways$group))
+# Assuming your dataframe is called consolidated_pathways
+consolidated_pathways$pathways <- gsub("HALLMARK ", "", consolidated_pathways$pathways) # Remove "HALLMARK "
+consolidated_pathways$pathways <- tolower(consolidated_pathways$pathways) # Convert to lowercase
+consolidated_pathways$pathways <- sapply(consolidated_pathways$pathways, function(x) {
+  paste(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))), sep = "")
+})
+
+
+p <- ggplot(consolidated_pathways, aes(x = group, y = reorder(pathways, -row))) +
+  geom_point(aes(colour = NES, size = size)) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        limits = c(-3.1, 4.2), oob = scales::squish) +
+  theme_light() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 8),
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(size = 10, angle = 90, hjust = 0,
+                                   margin = margin(t = 0, b = 10)), # Adjust the margin to move labels closer
+        plot.margin = unit(c(1, 1, 1, 1), "lines")) +
+  scale_x_discrete(position = "top") +
+  xlab("") +
+  ylab("") 
+
+p <- p + theme(legend.title = element_text(size = 8), # Adjust legend title size
+               legend.text = element_text(size = 6), # Adjust legend text size
+               legend.key.size = unit(0.4, "cm")) # Adjust legend key size
+
+# Display the plot
+p
+```
+
+```{r fgsea_reactome, message = FALSE, warning = FALSE}
+reactome <- fgsea::gmtPathways(paste0(workingdir, "genesets/ReactomePathwaysLevel3_2021-03.gmt"))
+
+results_dir <- paste0(workingdir, "results/reactome/")
+  if (!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+
+fgsea_results_list <- list()
+
+# Loop through each comparison using the results stored in 'result_list_deseq'
+for (comp in names(result_list_deseq)) {
+  # Use the stored DESeq2 result for the current comparison
+  res <- result_list_deseq[[comp]]
+  # Prepare a ranked list of genes for FGSEA
+  ranked_genes <- res$log2FoldChange
+  names(ranked_genes) <- rownames(res)
+  # Break ties by adding a small amount of noise
+
+  set.seed(123) # for reproducibility
+  noise <- runif(length(ranked_genes), min=-1e-10, max=1e-10)
+  ranked_genes <- ranked_genes + noise
+  # Sort genes by log2FoldChange to create a ranked list
+  ranked_genes_sorted <- sort(ranked_genes, decreasing = TRUE)
+  
+  # Perform FGSEA using fgseaMultilevel and handle pathways with unbalanced stats
+  # fgsea_results <- fgseaMultilevel(pathways = reactome, 
+  #                                    stats = ranked_genes_sorted,
+  #                                    minSize=100, maxSize=500)
+  
+    fgsea_results <- fgseaMultilevel(pathways = reactome, 
+                                     stats = ranked_genes_sorted)
+  
+  # Filter for significant pathways
+  gsea_sig <- fgsea_results %>% dplyr::filter(padj <= 0.05) %>% dplyr::arrange(desc(NES))
+  # Store the FGSEA result in the list
+  fgsea_results_list[[comp]] <- gsea_sig
+}
+
+dfList_up <- list()
+
+dfList <- fgsea_results_list
+
+# Assuming dfList is your list of dataframes
+for (i in seq_along(dfList)) {
+  name <- names(dfList)[i]
+  module <- as.data.frame(dfList[[i]])
+  # Select columns from module
+  topmodule <- module[, c(1, 3, 5, 6, 8)]
+  # Add a new column with -log10(padj)
+  topmodule$minuslogadjpvalue <- -log10(topmodule$padj)
+  # Rename the first column to "pathways"
+  colnames(topmodule)[1] <- "pathways"
+  # Count the number of genes in the leadingEdge column and create a new column "size"
+  topmodule$size <- sapply(strsplit(as.character(topmodule$leadingEdge), ", "), length)
+  topmodule <- topmodule %>%
+    mutate(group = 1)
+  # Assign the modified dataframe to dfList_up with the same name
+  dfList_up[[name]] <- topmodule
+}
+
+# head(dfList_up)
+
+# Initialize an empty list to store fgsea results
+fgsea_list <- list()
+
+# Loop through each dataframe in dfList_up
+for (name in names(dfList_up)) {
+  # Use tryCatch to handle errors
+  tryCatch({
+    # Extract the dataframe
+    topPathways <- dfList_up[[name]]
+    # Plot fgsea results for each cell
+    p <- ggplot(topPathways, aes(NES, pathways)) +
+      geom_point(aes(colour = padj, size = size)) +
+      scale_color_gradientn(colours = rainbow(4), limits = c(0, 0.05)) +
+      theme(panel.background = element_rect(fill = "gray95", colour = "gray95"),
+            panel.grid.major = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            panel.grid.minor = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            axis.title.y = element_blank()) +
+      expand_limits(x = c(-3, 4)) +
+      scale_x_continuous(breaks = c(-3, -2, -1, 0, 1, 2, 3, 4)) +
+      scale_y_discrete(limits = rev(topPathways$pathways)) +
+      ggtitle(paste0(name, " Reactome Pathways")) +
+      geom_vline(xintercept = 0, color = "gray", linetype = "dashed")
+    
+    # Save the plot
+    # ggsave( paste0(workingdir, "results/reactome/", "fgsea_plot_reactome_", gsub(" ", "_", name), ".svg"), plot = p, device = "svg")
+  }, error = function(e) {
+    # This is executed in case of an error
+    message("An error occurred in ", name, ": ", e$message)
+  })
+}
+
+# Consolidate pathways across all cells
+consolidated_pathways <- do.call("rbind", lapply(names(dfList_up), function(x) {
+  df <- dfList_up[[x]] %>%
+    mutate(group = x) %>%
+    dplyr::select(pathways, group, NES, size)
+}))
+
+consolidated_pathways <- consolidated_pathways %>%
+  mutate(
+    row = row_number(),
+    # pathways = str_replace_all(pathways, "HALLMARK_", ""),  # Remove "HALLMARK_" prefix
+    pathways = str_replace_all(pathways, "_", " "),  # Replace underscores with spaces in pathways
+    group = str_replace_all(group, "_", " ")  # Replace underscores with spaces in group
+  )
+
+consolidated_pathways$group <- factor(consolidated_pathways$group, levels = unique(consolidated_pathways$group))
+
+p <- ggplot(consolidated_pathways, aes(x = group, y = reorder(pathways, -row))) +
+  geom_point(aes(colour = NES, size = size)) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        limits = c(-3.1, 4.2), oob = scales::squish) +
+  theme_light() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 8),
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(size = 10, angle = 90, hjust = 0,
+                                   margin = margin(t = 0, b = 10)), # Adjust the margin to move labels closer
+        plot.margin = unit(c(1, 1, 1, 1), "lines")) +
+  scale_x_discrete(position = "top") +
+  xlab("") +
+  ylab("")
+
+p <- p + theme(legend.title = element_text(size = 8), # Adjust legend title size
+               legend.text = element_text(size = 6), # Adjust legend text size
+               legend.key.size = unit(0.4, "cm")) # Adjust legend key size
+p
+```
+
+
+```{r fgsea_kegg, message = FALSE, warning = FALSE}
+kegg <- fgsea::gmtPathways(paste0(workingdir, "genesets/kegg.genesets.v6.1.symbols.gmt"))
+
+
+results_dir <- paste0(workingdir, "results/kegg/")
+  if (!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+
+fgsea_results_list <- list()
+
+# Loop through each comparison using the results stored in 'result_list_deseq'
+for (comp in names(result_list_deseq)) {
+  # Use the stored DESeq2 result for the current comparison
+  res <- result_list_deseq[[comp]]
+  # Prepare a ranked list of genes for FGSEA
+  ranked_genes <- res$log2FoldChange
+  names(ranked_genes) <- rownames(res)
+  # Break ties by adding a small amount of noise
+  
+  # Why break ties?
+# In the context of FGSEA or similar pathway analysis methods, genes are ranked based on their log2 fold change, significance, or other statistics reflecting their association with the condition of interest. Sometimes, multiple genes may have the exact same statistic value, leading to ties in their ranks. Ties can pose a problem for statistical methods that rely on the rank order of genes, as the exact order of tied genes can affect the analysis results.
+# By adding a very small amount of noise to each gene's statistic, you slightly differentiate genes that were tied, ensuring that each gene gets a unique rank. This process maintains the overall order of the genes (since the noise is minimal) while resolving exact ties, thereby stabilizing the input for methods that require a strict ordering of genes.
+  
+  set.seed(123) # for reproducibility
+  noise <- runif(length(ranked_genes), min=-1e-10, max=1e-10)
+  ranked_genes <- ranked_genes + noise
+  # Sort genes by log2FoldChange to create a ranked list
+  ranked_genes_sorted <- sort(ranked_genes, decreasing = TRUE)
+  
+  # Perform FGSEA using fgseaMultilevel and handle pathways with unbalanced stats
+  # fgsea_results <- fgseaMultilevel(pathways = reactome, 
+  #                                    stats = ranked_genes_sorted,
+  #                                    minSize=100, maxSize=500)
+  
+    fgsea_results <- fgseaMultilevel(pathways = kegg, 
+                                     stats = ranked_genes_sorted)
+  
+  # Filter for significant pathways
+  gsea_sig <- fgsea_results %>% dplyr::filter(padj <= 0.05) %>% dplyr::arrange(desc(NES))
+  # Store the FGSEA result in the list
+  fgsea_results_list[[comp]] <- gsea_sig
+}
+
+dfList_up <- list()
+
+dfList <- fgsea_results_list
+
+# Assuming dfList is your list of dataframes
+for (i in seq_along(dfList)) {
+  name <- names(dfList)[i]
+  module <- as.data.frame(dfList[[i]])
+  # Select columns from module
+  topmodule <- module[, c(1, 3, 5, 6, 8)]
+  # Add a new column with -log10(padj)
+  topmodule$minuslogadjpvalue <- -log10(topmodule$padj)
+  # Rename the first column to "pathways"
+  colnames(topmodule)[1] <- "pathways"
+  # Count the number of genes in the leadingEdge column and create a new column "size"
+  topmodule$size <- sapply(strsplit(as.character(topmodule$leadingEdge), ", "), length)
+  topmodule <- topmodule %>%
+    mutate(group = 1)
+  # Assign the modified dataframe to dfList_up with the same name
+  dfList_up[[name]] <- topmodule
+}
+
+# head(dfList_up)
+
+# Initialize an empty list to store fgsea results
+fgsea_list <- list()
+
+# Loop through each dataframe in dfList_up
+for (name in names(dfList_up)) {
+  # Use tryCatch to handle errors
+  tryCatch({
+    # Extract the dataframe
+    topPathways <- dfList_up[[name]]
+    # Plot fgsea results for each cell
+    p <- ggplot(topPathways, aes(NES, pathways)) +
+      geom_point(aes(colour = padj, size = size)) +
+      scale_color_gradientn(colours = rainbow(4), limits = c(0, 0.05)) +
+      theme(panel.background = element_rect(fill = "gray95", colour = "gray95"),
+            panel.grid.major = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            panel.grid.minor = element_line(size = 0.25, linetype = 'solid', colour = "gray90"),
+            axis.title.y = element_blank()) +
+      expand_limits(x = c(-3, 4)) +
+      scale_x_continuous(breaks = c(-3, -2, -1, 0, 1, 2, 3, 4)) +
+      scale_y_discrete(limits = rev(topPathways$pathways)) +
+      ggtitle(paste0(name, " Kegg Pathways")) +
+      geom_vline(xintercept = 0, color = "gray", linetype = "dashed")
+    
+    # Save the plot
+    # ggsave( paste0(workingdir, "results/kegg/", "fgsea_plot_kegg_", gsub(" ", "_", name), ".svg"), plot = p, device = "svg")
+  }, error = function(e) {
+    # This is executed in case of an error
+    message("An error occurred in ", name, ": ", e$message)
+  })
+}
+
+# Consolidate pathways across all cells
+consolidated_pathways <- do.call("rbind", lapply(names(dfList_up), function(x) {
+  df <- dfList_up[[x]] %>%
+    mutate(group = x) %>%
+    dplyr::select(pathways, group, NES, size)
+}))
+
+consolidated_pathways <- consolidated_pathways %>%
+  mutate(
+    row = row_number(),
+    # pathways = str_replace_all(pathways, "HALLMARK_", ""),  # Remove "HALLMARK_" prefix
+    pathways = str_replace_all(pathways, "_", " "),  # Replace underscores with spaces in pathways
+    group = str_replace_all(group, "_", " ")  # Replace underscores with spaces in group
+  )
+
+consolidated_pathways$group <- factor(consolidated_pathways$group, levels = unique(consolidated_pathways$group))
+# Assuming your dataframe is called consolidated_pathways
+consolidated_pathways$pathways <- gsub("KEGG ", "", consolidated_pathways$pathways) # Remove "HALLMARK "
+consolidated_pathways$pathways <- tolower(consolidated_pathways$pathways) # Convert to lowercase
+consolidated_pathways$pathways <- sapply(consolidated_pathways$pathways, function(x) {
+  paste(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))), sep = "")
+})
+
+# Save in svg
+p <- ggplot(consolidated_pathways, aes(x = group, y = reorder(pathways, -row))) +
+  geom_point(aes(colour = NES, size = size)) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        limits = c(-3.1, 4.2), oob = scales::squish) +
+  theme_light() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 8),
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(size = 10, angle = 90, hjust = 0,
+                                   margin = margin(t = 0, b = 10)), # Adjust the margin to move labels closer
+        plot.margin = unit(c(1, 1, 1, 1), "lines")) +
+  scale_x_discrete(position = "top") +
+  xlab("") +
+  ylab("")
+
+p <- p + theme(legend.title = element_text(size = 8), # Adjust legend title size
+               legend.text = element_text(size = 6), # Adjust legend text size
+               legend.key.size = unit(0.4, "cm")) # Adjust legend key size
+
+p
+```
+
+
+```{r cemitool, message = FALSE, warning = FALSE, echo=TRUE, results='hide'}
+# Define gene sets path if you have it
+gene_sets <- read_gmt(paste0(workingdir, "genesets/ReactomePathwaysLevel3_2021-03.gmt"))
+
+
+# 6. Load the CEMiTool gene interactions file
+int_fname <- system.file("extdata", "interactions.tsv", package = "CEMiTool")
+int_ppi <- read.delim(int_fname)
+
+cem_list <- list()
+
+# Loop through each comparison
+for (comparison in comparisons) {
+  
+  # Split comparison string to get conditions
+  conditions <- strsplit(comparison, "_vs_")[[1]]
+  group1 <- conditions[1]
+  group2 <- conditions[2]
+  
+  # Subset sample metadata for the current comparison
+  sample_subset <- sample_info %>% 
+    filter(Group %in% c(group1, group2))
+
+  # colnames(sample)[colnames(sample) == "Group"] <- "Class"
+  # colnames(sample_subset)[colnames(sample_subset) == "Group"] <- "Class"
+  
+  # Subset expression data to include only samples in the current comparison
+  counts_subset <- exprs_norm_batch_corrected[, colnames(exprs_norm_batch_corrected) %in% sample_subset$SampleName]
+  counts_subset <- as.data.frame(counts_subset)
+  # Run CEMiTool
+  cem <- cemitool(expr = counts_subset, 
+                  annot = sample_subset, 
+                  gmt = gene_sets, 
+                  interactions = int_ppi, 
+                  filter = TRUE, 
+                  plot = TRUE, 
+                  verbose = TRUE, 
+                  network_type = "signed", 
+                  force_beta = TRUE)
+  
+  
+  cem_list[[comparison]] <- cem
+  # Save results
+  # Define a directory to save the results
+  results_dir <- paste0(workingdir, "cemitool/", comparison)
+  if (!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+  
+  # generate_report(cem, directory = paste0("/Users/vivianeschuch/Documents/RNAseq_inhouse_data/cemitool/", comparison, "/report"), force = TRUE)
+  write_files(cem, directory = paste0(workingdir, "cemitool/", comparison, "/tables/"), force = TRUE)
+  save_plots(cem, "all", directory = paste0(workingdir, "cemitool/", comparison, "/plots/"), force = TRUE)
+  diagnostic_report(cem, directory = paste0(workingdir, "cemitool/", comparison, "/diagnostics/"), force = TRUE)
+  save(cem, file = paste0(workingdir, "cemitool/", comparison, "/", comparison, ".Rdata"), compress = FALSE)
+  
+  # Print progress
+  cat("Completed CEMiTool for comparison:", comparison, "\n")
+}
+```
+
+
+```{r session_info, message = FALSE, warning = FALSE}
+# Write a session info of the execution of this script
+# Create the directory to save the session info file
+dir.create(paste0(workingdir, "/session_info/"), recursive = TRUE)
+# Write the session info in a txt
+# https://stackoverflow.com/questions/21967254/how-to-write-a-reader-friendly-sessioninfo-to-text-file
+sink(paste0(workingdir, "/session_info/", "sessionInfo.txt"))
+sessionInfo()
+sink()
+```
