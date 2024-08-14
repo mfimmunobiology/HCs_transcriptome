@@ -1230,39 +1230,14 @@ p <- p + theme(legend.title = element_text(size = 8), # Adjust legend title size
 p
 ```
 
+#Cemitool
 
-```{r cemitool, message = FALSE, warning = FALSE, echo=TRUE, results='hide'}
-# Define gene sets path if you have it
-gene_sets <- read_gmt(paste0(workingdir, "genesets/ReactomePathwaysLevel3_2021-03.gmt"))
+```{r}
+head(sample_info)
+exprs_norm_batch_corrected <- as.data.frame(exprs_norm_batch_corrected)
 
-
-# 6. Load the CEMiTool gene interactions file
-int_fname <- system.file("extdata", "interactions.tsv", package = "CEMiTool")
-int_ppi <- read.delim(int_fname)
-
-cem_list <- list()
-
-# Loop through each comparison
-for (comparison in comparisons) {
-  
-  # Split comparison string to get conditions
-  conditions <- strsplit(comparison, "_vs_")[[1]]
-  group1 <- conditions[1]
-  group2 <- conditions[2]
-  
-  # Subset sample metadata for the current comparison
-  sample_subset <- sample_info %>% 
-    filter(Group %in% c(group1, group2))
-
-  # colnames(sample)[colnames(sample) == "Group"] <- "Class"
-  # colnames(sample_subset)[colnames(sample_subset) == "Group"] <- "Class"
-  
-  # Subset expression data to include only samples in the current comparison
-  counts_subset <- exprs_norm_batch_corrected[, colnames(exprs_norm_batch_corrected) %in% sample_subset$SampleName]
-  counts_subset <- as.data.frame(counts_subset)
-  # Run CEMiTool
-  cem <- cemitool(expr = counts_subset, 
-                  annot = sample_subset, 
+cem <- cemitool(expr = exprs_norm_batch_corrected, 
+                  annot = sample_info, 
                   gmt = gene_sets, 
                   interactions = int_ppi, 
                   filter = TRUE, 
@@ -1272,23 +1247,159 @@ for (comparison in comparisons) {
                   force_beta = TRUE)
   
   
-  cem_list[[comparison]] <- cem
-  # Save results
-  # Define a directory to save the results
-  results_dir <- paste0(workingdir, "cemitool/", comparison)
-  if (!dir.exists(results_dir)) {
-    dir.create(results_dir, recursive = TRUE)
-  }
-  
-  # generate_report(cem, directory = paste0("/Users/vivianeschuch/Documents/RNAseq_inhouse_data/cemitool/", comparison, "/report"), force = TRUE)
-  write_files(cem, directory = paste0(workingdir, "cemitool/", comparison, "/tables/"), force = TRUE)
-  save_plots(cem, "all", directory = paste0(workingdir, "cemitool/", comparison, "/plots/"), force = TRUE)
-  diagnostic_report(cem, directory = paste0(workingdir, "cemitool/", comparison, "/diagnostics/"), force = TRUE)
-  save(cem, file = paste0(workingdir, "cemitool/", comparison, "/", comparison, ".Rdata"), compress = FALSE)
-  
-  # Print progress
-  cat("Completed CEMiTool for comparison:", comparison, "\n")
-}
+
+# Save results
+# generate_report(cem, directory = paste0("/Users/vivianeschuch/Documents/RNAseq_inhouse_data/cemitool/", comparison, "/report"), force = TRUE)
+write_files(cem, directory = "/home/vivischuch/Documents/cemitool_modules/", force = TRUE)
+save_plots(cem, "all", directory = "/home/vivischuch/Documents/cemitool_modules/", force = TRUE)
+diagnostic_report(cem, directory = "/home/vivischuch/Documents/cemitool_modules/", force = TRUE)
+save(cem, file = "/home/vivischuch/Documents/cemitool_modules/", compress = FALSE)
+```
+
+# GSEA
+
+```{r}
+# Load required libraries
+library(readr)
+library(ggplot2)
+library(reshape2)
+
+# Read the data from the TSV file
+data <- read_tsv("/home/vivischuch/Documents/cemitool_modules/enrichment_nes.tsv")
+
+# Print the data to verify
+print(data)
+
+# Melt the dataframe
+data_melt <- melt(data, id.vars = "pathway")
+
+# Identify the column names for the eg and T samples
+eg_samples <- colnames(data)[grepl("_eg", colnames(data))]
+t_samples <- colnames(data)[grepl("_T", colnames(data))]
+
+# Create a new order for the variable factor with a gap
+new_order <- c(eg_samples, "gap", t_samples)
+
+# Add a gap column with NA values
+data_melt <- rbind(data_melt, data.frame(pathway = rep(data$pathway, each = 1), variable = "gap", value = NA))
+
+# Convert pathway and variable to factors to maintain order and invert y-axis order
+data_melt$pathway <- factor(data_melt$pathway, levels = rev(data$pathway))
+data_melt$variable <- factor(data_melt$variable, levels = new_order)
+
+# Create the heatmap with blue and red gradient and a gap
+heatmap_plot <- ggplot(data_melt, aes(x = variable, y = pathway, fill = value)) +
+  geom_tile(color = "white", na.rm = FALSE) +
+  geom_tile(data = subset(data_melt, !is.na(value)), color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, na.value = "white") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15)
+  ) +
+  labs(
+    title = "",
+    x = "",
+    y = ""
+  ) +
+  scale_x_discrete(labels = function(x) ifelse(x == "gap", "", x)) # Remove label for gap
+
+# Display the plot
+heatmap_plot
+
+# Save the plot as an SVG file with small size and readable labels
+ggsave("/home/vivischuch/Documents/cemitool_modules/heatmap_plot.svg", plot = heatmap_plot, width = 3, height = 4)
+
+```
+
+# lolliplot
+
+```{r}
+# Load required libraries
+library(ggplot2)
+library(readr)
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(RColorBrewer)
+library(viridis)
+
+
+data <- read_tsv("/home/vivischuch/Documents/cemitool_modules/ora1.csv")
+
+data$log_p_adjust <- -log10(data$p.adjust)
+
+# Create a new unique identifier for each row
+data <- data %>%
+  mutate(y_pos = row_number())
+
+# Reverse the order of the y-axis
+data <- data %>%
+  mutate(y_pos = max(y_pos) - y_pos + 1)
+
+# Generate a distinct color palette
+num_colors <- length(unique(data$Module))
+palette <- rep(brewer.pal(12, "Paired"), length.out = num_colors)
+
+# Create the lollipop plot
+lollipop_plot <- ggplot(data, aes(x = log_p_adjust, y = y_pos, color = Module)) +
+  geom_segment(aes(x = 0, xend = log_p_adjust, y = y_pos, yend = y_pos), size = 1) +
+  geom_point(size = 3) +
+  geom_text(aes(label = ID), hjust = -0.1, size = 6, color = "black") +
+  scale_y_continuous(breaks = data$y_pos, labels = data$Module) +
+  scale_color_manual(values = palette) +
+  geom_vline(xintercept = -log10(0.05), linetype = "dotted", color = "red", size = 1) +  # Add vertical dotted line
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 14),
+    axis.text.x = element_text(size = 14),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    legend.position = "none",
+    panel.grid.major.y = element_blank(),  # Remove horizontal major grid lines
+    panel.grid.minor.y = element_blank(),  # Remove horizontal minor grid lines
+    panel.grid.major.x = element_line(color = "grey", size = 0.5),  # Keep vertical major grid lines
+    panel.grid.minor.x = element_line(color = "grey", size = 0.25)  # Keep vertical minor grid lines
+  ) +
+  labs(title = "",
+       x = "-log10(p.adjust)",
+       y = "")
+
+
+data$Category <- ifelse(grepl("immune|Interferon|cytokine|lymphoid|MHC|TCR|interleukins|signaling", 
+                              data$ID, ignore.case = TRUE),
+                        "Immune System", "Non-Immune System")
+
+
+lollipop_plot <- ggplot(data, aes(x = log_p_adjust, y = y_pos, color = Category)) +
+  geom_segment(aes(x = 0, xend = log_p_adjust, y = y_pos, yend = y_pos), size = 4) +  # Increase the line width
+  geom_point(size = 5) +  # Increase the size of the dots
+  geom_text(aes(label = ID), hjust = -0.1, size = 6, color = "black") +
+  scale_y_continuous(breaks = data$y_pos, labels = data$Module) +
+  scale_color_manual(values = c("Immune System" = "#FF69B4",  # Pink
+                                "Non-Immune System" = "#8B4513")) +  # Brown
+  geom_vline(xintercept = -log10(0.05), linetype = "dotted", color = "gray", size = 1) +  # Add vertical dotted line
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 14),
+    axis.text.x = element_text(size = 14),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    legend.position = "right",  # Adjust legend position
+    panel.grid.major.y = element_blank(),  # Remove horizontal major grid lines
+    panel.grid.minor.y = element_blank(),  # Remove horizontal minor grid lines
+    panel.grid.major.x = element_line(color = "grey", size = 0.5),  # Keep vertical major grid lines
+    panel.grid.minor.x = element_line(color = "grey", size = 0.25)  # Keep vertical minor grid lines
+  ) +
+  labs(title = "",
+       x = "-log10(p.adjust)",
+       y = "")
+# Display the plot
+print(lollipop_plot)
+
+# Save the plot as an SVG file
+ggsave("/home/vivischuch/Documents/cemitool_modules/lollipop_plot.svg", plot = lollipop_plot, width = 10, height = 7.6)
+
 ```
 
 
