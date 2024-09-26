@@ -1,0 +1,62 @@
+Tube Label,Donor,Treatment,Gestation
+J34,151,CMV,Early Gestation
+J41,151,CMV,Early Gestation
+J48,139,CMV,Early Gestation
+J29,151,HIV,Early Gestation
+J36,151,HIV,Early Gestation
+J43,146,HIV,Early Gestation
+J30,151,IFNa,Early Gestation
+J37,151,IFNa,Early Gestation
+J44,146,IFNa,Early Gestation
+J50,139,IFNa,Early Gestation
+J31,151,IFNB,Early Gestation
+J38,151,IFNB,Early Gestation
+J45,146,IFNB,Early Gestation
+J32,151,IFNL,Early Gestation
+J39,151,IFNL,Early Gestation
+J46,146,IFNL,Early Gestation
+J51,139,IFNL,Early Gestation
+J49,139,LPS,Early Gestation
+J28,151,NT,Early Gestation
+J35,151,NT,Early Gestation
+J42,146,NT,Early Gestation
+J47,139,NT,Early Gestation
+J52,139,PIC,Early Gestation
+J53,146,rigi ag,Early Gestation
+J33,151,ZIKV,Early Gestation
+J40,151,ZIKV,Early Gestation
+J7,159,CMV,Term
+J14,116,CMV,Term
+J20,102,CMV,Term
+J27,147,CMV,Term
+J61,122,CMV,Term
+J2,159,HIV,Term
+J9,116,HIV,Term
+J16,102,HIV,Term
+J22,147,HIV,Term
+J55,122,HIV,Term
+J3,159,IFNa,Term
+J10,116,IFNa,Term
+J17,102,IFNa,Term
+J23,147,IFNa,Term
+J56,122,IFNa,Term
+J4,159,IFNB,Term
+J11,116,IFNB,Term
+J18,102,IFNB,Term
+J24,147,IFNB,Term
+J57,122,IFNB,Term
+J5,159,IFNL,Term
+J12,116,IFNL,Term
+J19,102,IFNL,Term
+J25,147,IFNL,Term
+J58,122,IFNL,Term
+J59,122,LPS,Term
+J1,159,NT,Term
+J8,116,NT,Term
+J15,102,NT,Term
+J21,147,NT,Term
+J54,122,NT,Term
+J60,122,PIC,Term
+J6,159,ZIKV,Term
+J13,116,ZIKV,Term
+J26,147,ZIKV,Term
