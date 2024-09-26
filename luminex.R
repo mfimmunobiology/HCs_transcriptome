@@ -27,7 +27,7 @@ options(stringsAsFactors = F)
 # You might need to install these libraries using install.packages() if you don't have them installed already
 library(DataExplorer)
 ### Read the XLSX file
-data <- read.csv("Results-Table 1.csv")
+data <- read.csv("Results-Luminex.csv")
 colnames(data)
 
 data <- data %>%
