@@ -38,34 +38,7 @@ data <- filter(data, Rep != "AVERAGE")
 str(data)
 
 #Exploratory Data Analysis
-# create_report(data)
-
-
-
-### Evaluatew the batch effect (more than 1 plate)- if applicable
-# To do this, you need to remove the categorical variables
-# data2 = data[,-c(1:2)]
-# data2[is.na(data2)] = 0
-# input_data_pc  = prcomp(data2,
-#                         center = T,
-#                         scale. = T)
-# ggbiplot(input_data_pc,
-#          obs.scale = 1,
-#          var.scale = 1,
-#          groups = data2$Plate,
-#          ellipse = T,
-#          var.axes = F,
-#          circle = T) +
-#   theme(legend.direction = 'vertical',
-#         legend.position = 'right')+
-#   theme_bw() +
-#   theme(panel.grid.major = element_blank(),
-#         panel.grid.minor = element_blank(),
-#         legend.position="bottom",
-#         aspect.ratio = 1)+
-#   ggtitle("")
-
-
+create_report(data)
 
 ### Impute data, if necessary, using pmm method
 imp <- mice::mice(data = data[, -c(1:2)], method = "pmm")
@@ -102,26 +75,8 @@ data_raw_plot2 <- data_raw_plot2 %>%
   filter(!str_detect(Treatment, "rigi ag"))
 
 
+### Change variables and create tables to compare de groups of interest
 str(data_raw_plot2)
-
-
-library(ggplot2)
-library(dplyr)
-
-# Assuming 'data_raw_plot2' is your dataframe and it includes the measure in a column named 'IL_6'.
-# Creating a new column combining 'Treatment' and 'Gestation' if not already done
-data_raw_plot2 <- data_raw_plot2 %>%
-  mutate(Treatment_Gestation = paste(Treatment, Gestation, sep="."))
-
-# Plotting IL-6 levels across these combined groups, with color based on Treatment
-ggplot(data_raw_plot2, aes(x=Treatment_Gestation, y=IL_6, fill=Treatment)) +
-  geom_boxplot() +
-  theme_minimal() +
-  labs(title="IL-6 Levels by Treatment and Gestation", x="Treatment and Gestation", y="IL-6 (pg/ml)") +
-  theme(axis.text.x = element_text(angle=45, hjust=1), 
-        legend.title=element_blank()) +
-  scale_fill_brewer(palette="Paired") # Colors the boxplots based on Treatment
-
 
 
 # Continue from the previous step where you've created Treatment_Gestation
@@ -129,38 +84,6 @@ data_raw_plot2 <- data_raw_plot2 %>%
   mutate(Treatment_Gestation = paste(Treatment, Gestation, sep="."))
 
 data_raw_plot2$Treatment_Gestation <- as.character(data_raw_plot2$Treatment_Gestation)
-
-# Then list the unique values to verify your group names
-unique(data_raw_plot2$Treatment_Gestation)
-# Step 1: Extract unique treatments and gestations
-unique_treatments <- unique(gsub("\\..*", "", data_raw_plot2$Treatment_Gestation))
-
-# Step 2: Identify pairs for comparison
-comparison_list <- lapply(unique_treatments, function(treatment) {
-  early <- paste(treatment, "Early Gestation", sep=".")
-  term <- paste(treatment, "Term", sep=".")
-  if(early %in% data_raw_plot2$Treatment_Gestation & term %in% data_raw_plot2$Treatment_Gestation){
-    return(c(early, term))
-  }
-})
-
-# Remove NULL elements
-comparison_list <- Filter(Negate(is.null), comparison_list)
-
-
-ggplot(data_raw_plot2, aes(x=Treatment_Gestation, y=TNF_α, fill=Treatment)) +
-  geom_boxplot() +
-  geom_signif(comparisons = comparison_list, map_signif_level = TRUE) +
-  theme_minimal() +
-  labs(title="TNF_α Levels by Treatment and Gestation", x="Treatment and Gestation", y="TNF_α (pg/ml)") +
-  theme(axis.text.x = element_text(angle=45, hjust=1), legend.title=element_blank()) +
-  scale_fill_brewer(palette="Paired")
-
-ggsave(filename = "luminex_analysis_plot_TNF_α.svg", plot = last_plot())
-
-
-
-#PCA ANALYSIS
 
 
 
@@ -185,15 +108,14 @@ autoplot(prcomp(df, center = T, scale. = T), data = All_cytokine_data, loadings 
 dev.off()
 
 
+
 # ##############################
 
 head(data_raw_plot2)
 
 
-# data_raw_plot <- as.data.frame(t(data_raw_plot2))
 names(data_raw_plot2) <- gsub(".", "_", names(data_raw_plot2), fixed = TRUE)
-# data_raw_plot$groups <- metadata$groups
-# data_raw_plot2$Sample <- rownames(data_raw_plot2)
+
 data_raw_plot2 <- merge(data_raw_plot2, metadata)
 
 head(data_raw_plot2)
@@ -204,7 +126,100 @@ original_df$Donor <- NULL
 original_df$groups <- NULL
 original_df$Treatment_Gestation <- NULL
 
-# original_df[, 4:18] <- log(original_df[3:17], 10)
+# Convert the dataframe to a data.table
+setDT(original_df)
+
+head(original_df)
+library(ggpubr)
+
+# Function to split data.table into a list of dataframes
+split_dataframe <- function(dt, col_indices) {
+  num_cols <- ncol(dt)
+  # Create a list of dataframes, each containing the selected columns
+  df_list <- lapply(seq(3, num_cols, by = 1), function(i) {
+    selected_cols <- c(1, 2, i)  # Select first two columns and the current index
+    dt[, ..selected_cols, with = FALSE]
+  })
+  
+  return(df_list)
+}
+
+# apply the function split_dataframe
+df_list <- split_dataframe(original_df)
+names(df_list) <- colnames(original_df[,c(3:17)])
+
+
+# Function to do the boxplots
+boxplots <- sapply(df_list, simplify = F, USE.NAMES = T, function(x){
+  df <- x
+  df <- df_list[[10]]
+  title <- colnames(df)[3]
+  colnames(df)[3] <- "value"
+  colnames(df)[1] <- "treat"
+  colnames(df)[2] <- "group"
+  df <- as.data.frame(df)
+  df<-df[!(df$treat=="rigi ag" | df$treat=="PIC" | df$treat=="LPS"| df$treat=="ZIKV" | df$treat=="IFNa"| df$treat=="IFNB" | df$treat=="IFNL"),]
+  
+  df$treat <- factor(df$treat, levels = c("NT", "CMV", "HIV"))
+  
+  stat.test <- df %>%
+    group_by(treat) %>%
+    t_test(value ~ group) %>%
+    add_significance("p")
+  stat.test
+  
+  my_palette <- c("coral2", "steelblue", "gold", "darkgreen", "purple", "orange", "pink")
+  
+  
+  # Create a box plot
+  bxp <- ggboxplot(
+    df, x = names(df)[1], 
+    y = names(df)[3], 
+    fill = names(df)[2], 
+    palette = my_palette,
+    size = 0.2,
+    legend = "top",
+    legend.title = "",
+    bxp.errorbar = TRUE,
+    bxp.errorbar.width = 0.15, 
+    outlier.shape = 1,
+    xlab = "", 
+    ylab = "pg/ml",
+    title = title
+  ) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+  bxp
+  stat.test <- stat.test %>% add_xy_position(x = "treat", dodge = 0.7, fun = "max", step.increase = 0.12)
+  bxp.complex <- bxp + stat_pvalue_manual(
+    stat.test,  label = "{p.signif}", hide.ns = TRUE, tip.length = 0.01
+  ) + scale_y_continuous(expand = expansion(mult = c(0, 0.1))) 
+  bxp.complex
+
+  return(bxp.complex)
+})
+
+
+plots <- do.call("ggarrange", c(boxplots, ncol=5, nrow =3, common.legend = TRUE, legend="top"))
+
+png("boxplots_all.png", width = 1920, height = 1080)
+plots
+dev.off()
+
+
+lapply(names(boxplots), 
+       function(x)ggsave(filename=paste(x,".png",sep=""), plot=boxplots[[x]]))
+
+
+# #################
+
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(dplyr)
+library(data.table)
+library(ggpubr)
+library(tidyr)
 
 # Convert the dataframe to a data.table
 setDT(original_df)
@@ -232,11 +247,22 @@ df_long <- df %>%
 
 # grouped_data <- df_long %>%
 #   group_by(Treatment, Gestation)
+
 # Display the structure of the long format dataframe
 head(df_long)
 str(df_long)
 
-
+df_long <- df_long %>%
+  mutate(
+    Interaction = gsub("CMV\\.Early Gestation", "CMV EG", Interaction),
+    Interaction = gsub("CMV\\.Term", "CMV TG", Interaction),
+    Interaction = gsub("HIV\\.Early Gestation", "HIV EG", Interaction),
+    Interaction = gsub("HIV\\.Term", "HIV TG", Interaction),
+    Interaction = gsub("NT\\.Early Gestation", "NT EG", Interaction),
+    Interaction = gsub("NT\\.Term", "NT TG", Interaction),
+    Cytokine = gsub("_", "-", Cytokine)  # Remove underline from Cytokine column
+  ) %>%
+  mutate(Interaction = factor(Interaction, levels = c("NT EG", "HIV EG", "CMV EG", "NT TG", "HIV TG", "CMV TG")))
 
 kruskal_results <- df_long %>%
   group_by(Cytokine) %>%
@@ -255,30 +281,35 @@ normality_test_results <- df_long %>%
 # View the results
 print(normality_test_results)
 
-
 # View the results
 print(kruskal_results)
-
-
 
 library(ggplot2)
 library(ggsignif)
 library(dunn.test)
 library(dplyr)
 
-# Adjusted function to perform post-hoc tests and generate plots for all proteins
 plot_cytokine_with_significance <- function(cytokine_name, df_long, all_significant_comparisons) {
   df_cytokine <- filter(df_long, Cytokine == cytokine_name)
+  
+  df_cytokine$Interaction <- factor(df_cytokine$Interaction, 
+                                    levels = c("HIV EG", "CMV EG", "NT EG", "HIV TG", "CMV TG", "NT TG"))
   
   post_hoc_results <- dunn.test(x = df_cytokine$Level, g = df_cytokine$Interaction, method = "bonferroni")
   
   significant_comparisons <- all_significant_comparisons[all_significant_comparisons$Cytokine == cytokine_name, ]
   
-  p <- ggplot(df_cytokine, aes(x = Interaction, y = Level, fill = Treatment)) +
+  p <- ggplot(df_cytokine, aes(x = Interaction, y = Level, fill = Gestation)) +
     geom_boxplot() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    theme_classic() +  # Change to a minimal theme
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+          axis.text.y = element_text(size = 10),
+          axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 10),
+          plot.title = element_text(size = 18)) +
     labs(title = cytokine_name, y = "pg/ml", x = "") +
-    scale_fill_brewer(palette = "Pastel1")
+    scale_fill_manual(values = c("#F8766D", "#00BFC4"))
+  # scale_fill_brewer(palette = "Set2")
   
   if (nrow(significant_comparisons) > 0) {
     max_y <- max(df_cytokine$Level, na.rm = TRUE)
@@ -288,10 +319,12 @@ plot_cytokine_with_significance <- function(cytokine_name, df_long, all_signific
       comp <- strsplit(as.character(significant_comparisons$comparisons[i]), " - ")[[1]]
       if (length(comp) == 2) {  # Ensure we have a pair to compare
         p_value <- as.numeric(significant_comparisons[i, "P.adjusted"])
-        significance <- ifelse(p_value > 0.07, "*", ifelse(p_value > 0.05, "**", ifelse(p_value > 0.03, "***", "***")))
+        significance <- ifelse(p_value > 0.05 & p_value < 0.07, "*", 
+                               ifelse(p_value > 0.01 & p_value <= 0.05, "**", 
+                                      ifelse(p_value <= 0.01, "***", "")))
         p <- p + geom_signif(comparison = list(comp),
                              map_signif_level = TRUE,
-                             textsize = 4,
+                             textsize = 6,
                              vjust = 0.5,
                              y_position = max_y + i * y_increment,
                              annotations = significance)
@@ -302,10 +335,8 @@ plot_cytokine_with_significance <- function(cytokine_name, df_long, all_signific
   return(p)
 }
 
-
 unique_cytokines <- unique(df_long$Cytokine)
 
-# Combine significant comparisons for all cytokines into one data frame
 all_significant_comparisons <- data.frame()
 
 for (cytokine in unique_cytokines) {
@@ -314,13 +345,12 @@ for (cytokine in unique_cytokines) {
   significant_comparisons <- data.frame(Cytokine = cytokine,
                                         comparisons = post_hoc_results$comparisons,
                                         P.adjusted = post_hoc_results$P.adjusted)
-  significant_comparisons <- significant_comparisons[significant_comparisons$P.adjusted < 0.1, ]
+  significant_comparisons <- significant_comparisons[significant_comparisons$P.adjusted < 0.07, ]
   all_significant_comparisons <- rbind(all_significant_comparisons, significant_comparisons)
 }
 
 # Print the table of all significant comparisons
 print(all_significant_comparisons)
-
 
 
 
@@ -333,7 +363,7 @@ for (cytokine in unique_cytokines) {
 }
 
 # Example: display or save the plot for a specific protein
-print(plots[["IL_5"]])  # Replace "GM_CSF" with the actual name of the protein
+# print(plots[["IL_5"]])  # Replace "GM_CSF" with the actual name of the protein
 
 # Optionally, save plots to files
 for (cytokine in names(plots)) {
@@ -355,6 +385,7 @@ grid_arranged <- do.call(grid.arrange, c(plot_list, ncol = 5))
 
 
 # Save the grid of plots with a single legend
-ggsave("grid_of_plots_with_legend.svg", grid_arranged, width = 15, height = 10)
+ggsave("grid_of_plots_with_legend.png", grid_arranged, width = 16, height = 12)
 
+ggsave("grid_of_plots_with_legend.svg", grid_arranged, width = 16, height = 12)
 
